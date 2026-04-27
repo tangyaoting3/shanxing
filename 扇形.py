@@ -1,1376 +1,994 @@
-import time
-import math
-import copy
-import os
-import numpy as np
 import torch
 import torch.nn as nn
+import torch.optim as optim
+import numpy as np
+from pyDOE2 import lhs
+from torch.optim.lr_scheduler import MultiStepLR
 import matplotlib.pyplot as plt
+import os
+import copy
+from time import time
 
-# ============================================================
-# 1. 参数定义模块
-# ============================================================
-
-# ---------- 运行设备与数值精度 ----------
-torch.set_default_dtype(torch.float64)
+# =========================================================
+# 0. 硬件与全局设置
+# =========================================================
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-dtype = torch.float64
+os.environ["KMP_DUPLICATE_LIB_OK"] = "TRUE"
 
-# ---------- 随机种子 ----------
-SEED = 2026
-np.random.seed(SEED)
-torch.manual_seed(SEED)
-if torch.cuda.is_available():
-    torch.cuda.manual_seed_all(SEED)
+# 建议使用 float64，适合固体力学 PINN
+DTYPE = torch.float64
+torch.set_default_dtype(DTYPE)
 
-# ---------- 几何参数（严格按题述） ----------
-R_outer = 0.392                 # m
-R_inner = 0.187                 # m
-theta_half_deg = 19.8           # deg
-theta_min = -np.deg2rad(theta_half_deg)
-theta_max =  np.deg2rad(theta_half_deg)
-H_total = 0.07                  # m
+# 关闭 TF32，避免双精度/高阶导数时出现额外数值扰动
+torch.backends.cuda.matmul.allow_tf32 = False
+torch.backends.cudnn.allow_tf32 = False
 
-# ---------- 凹槽参数（严格按题述） ----------
-x_groove = 0.2895               # m
-y_groove_top = 0.07             # m
-y_groove_bottom = 0.05          # m
-R_groove = 0.05                 # m
+# =========================================================
+# 1. 材料参数（严格按题意）
+# =========================================================
+E_val = 2.0e11
+v_val = 0.3
 
-# ---------- 材料参数（严格按题述） ----------
-E = 2.0e9                       # Pa
-nu = 0.3
-mu = E / (2.0 * (1.0 + nu))
-lam = E * nu / ((1.0 + nu) * (1.0 - 2.0 * nu))
+E = torch.tensor(E_val, dtype=DTYPE, device=device)
+v = torch.tensor(v_val, dtype=DTYPE, device=device)
+lmda = E * v / ((1 + v) * (1 - 2 * v))
+mu = E / (2 * (1 + v))
 
-# ---------- 载荷参数（严格按题述） ----------
-F_total = 76400.0               # N
+# =========================================================
+# 2. 几何参数（严格按题意）
+# 坐标系：
+#   x: 水平向右
+#   y: 竖直向上（高度方向）
+#   z: 垂直于 x-y 平面
+# 柱坐标关系：
+#   r = sqrt(x^2 + z^2), x = r cos(theta), z = r sin(theta)
+# =========================================================
+R_inner = 0.187
+R_outer = 0.392
+H_total = 0.07
 
+theta_half_deg = 19.8
+theta_half = np.deg2rad(theta_half_deg)
+theta_min = -theta_half
+theta_max = theta_half
+
+# 凹槽参数
+x_groove = 0.2895
+R_groove = 0.05
+y_groove_bottom = 0.05
+y_groove_top = 0.07
+
+# =========================================================
+# 3. 载荷参数
+# 底面 y=0 施加沿 +Y 的总力 F_total，换算为均布面力 q_load
+# =========================================================
+F_total = 76400.0
+
+# 底面面积 = 扇环面积
 bottom_area = 0.5 * (theta_max - theta_min) * (R_outer**2 - R_inner**2)
-q_load = F_total / bottom_area   # 均布面力大小，沿 +Y 方向
-print(f"[信息] 底面受力面积 = {bottom_area:.6e} m^2")
-print(f"[信息] 均布面力 q = {q_load:.6e} Pa (沿 +Y 方向)")
+q_load = F_total / bottom_area  # Pa
 
-# ---------- 数值尺度（仅用于损失缩放与网络参数化，不改变物理单位） ----------
-# 说明：所有输入输出仍然使用 SI 单位，以下参考尺度只用于 PINN 训练稳定化。
-L_ref = H_total
-T_ref = abs(q_load)                           # traction reference
-U_ref = T_ref * L_ref / E                     # displacement reference ~ qL/E
-groove_depth = y_groove_top - y_groove_bottom
-main_volume = bottom_area * H_total
-groove_volume = np.pi * R_groove**2 * groove_depth
-solid_volume = main_volume - groove_volume
-Energy_ref = bottom_area * T_ref * U_ref     # 能量参考尺度 ~ q * A * u
+print(f"[INFO] bottom_area = {bottom_area:.6e} m^2")
+print(f"[INFO] q_load      = {q_load:.6e} Pa")
 
-# ---------- 训练参数 ----------
-N_int = 4000                  # 内部点数
-N_edge = 2400                 # 凹槽底缘邻域内部点数
-N_energy = 4000               # 能量积分用的均匀内部点数
-N_dir = 2400                  # 凹槽底面固支边界点数
-N_dir_edge = 1200             # 凹槽底面近边缘固支加密点数
-N_neu = 2400                  # 底面受力边界点数
-N_free = 4000                 # 其余自由表面零牵引边界点数（含凹槽侧壁）
-N_free_edge = 1200            # 凹槽侧壁近底缘自由面加密点数
+# =========================================================
+# 4. 训练时的参考尺度（只用于损失归一化，不改变物理模型）
+# =========================================================
+L_ref = R_outer - R_inner
+SIGMA_REF = q_load
+U_REF = q_load * L_ref / E_val
+PDE_REF = SIGMA_REF / L_ref               # div(sigma) 的量纲尺度
 
-# ---------- 凹槽底缘局部加密采样参数 ----------
-edge_refine_ratio_int = 0.30
-edge_refine_ratio_dir = 0.25
-edge_refine_ratio_free = 0.25
+print(f"[INFO] L_ref       = {L_ref:.6e} m (radial thickness)")
+print(f"[INFO] U_REF       = {U_REF:.6e} m")
+print(f"[INFO] SIGMA_REF   = {SIGMA_REF:.6e} Pa")
+print(f"[INFO] PDE_REF     = {PDE_REF:.6e} Pa/m")
 
-edge_refine_radius = 0.008    # m，凹槽底缘邻域径向加密范围
-edge_refine_height = 0.006    # m，凹槽底缘邻域竖向加密范围
-edge_surface_band = 0.003     # m，边界近底缘带宽
+# =========================================================
+# 4.1 训练控制参数
+# =========================================================
+resample_every = 50
+adam_epochs = 2000
+adam_milestones = [800, 1400, 1800]
 
-epochs = 12000
-resample_every = 20
-print_every = 100
+# The boundary terms converge quickly in this case. Keeping the adaptive
+# GradNorm-style weights on tends to keep amplifying already-small boundary
+# losses, so the default run uses fixed, PDE-focused weights.
+use_adaptive_weights = False
 
-lr = 1.0e-4
-eta_min = 1.0e-6
+# PDE = equilibrium + constitutive consistency. The raw Eq term is the main
+# bottleneck in the current logs, so keep it explicit. The constitutive term
+# should not be too large from epoch 0, otherwise it can flatten the
+# displacement gradients before the thickness response is learned.
+w_eq_pde = 10.0
+w_const_pde_start = 2.0
+w_const_pde_end = 4.0
+const_ramp_start = 600
+const_ramp_end = 1600
 
-w_pde = 1.0
-w_pde_edge = 3.0
-w_energy = 1.0
-w_dir = 800.0
-w_dir_edge = 2000.0
-w_neu = 20.0
-w_free = 20.0
-w_free_edge = 80.0
-w_const = 10.0
+# The bottom load is a resultant-force condition in practice. A pointwise
+# traction MSE can look modest even when the mean traction is still 15-20%
+# below the target, so add an explicit mean-traction penalty.
+load_mean_weight = 5.0
 
-grad_clip = 1.0
+def get_const_weight(epoch):
+    if epoch <= const_ramp_start:
+        return w_const_pde_start
+    if epoch >= const_ramp_end:
+        return w_const_pde_end
+    t = (epoch - const_ramp_start) / (const_ramp_end - const_ramp_start)
+    return w_const_pde_start + t * (w_const_pde_end - w_const_pde_start)
 
-# ---------- L-BFGS 精修参数 ----------
-use_lbfgs_finetune = True
-lbfgs_lr = 0.5
-lbfgs_max_iter = 300
-lbfgs_history_size = 50
-lbfgs_print_every = 20
+# =========================================================
+# 5. 输入归一化边界（保持模板风格）
+# 注意这里用整个包围盒做 [-1,1] 归一化
+# =========================================================
+lb = torch.tensor([-R_outer, 0.0, -R_outer], dtype=DTYPE, device=device)
+ub = torch.tensor([ R_outer, H_total, R_outer], dtype=DTYPE, device=device)
 
-# ---------- SIREN 网络参数 ----------
-in_features = 3
-out_features = 9
-hidden_features = 128
-hidden_layers = 5
-first_omega_0 = 30.0
-hidden_omega_0 = 30.0
+# =========================================================
+# 6. 几何辅助函数
+# =========================================================
+def lhs_tensor(dim, n):
+    n = int(n)
+    if n <= 0:
+        return torch.empty((0, dim), dtype=DTYPE, device=device)
+    return torch.tensor(lhs(dim, n), dtype=DTYPE, device=device)
 
-# ---------- 模型保存参数 ----------
-model_save_name = "pinn_sector_siren_mixed_model.pth"
-
-# ============================================================
-# 2. 几何与采样模块
-# ============================================================
-
-def angle_np(x, z):
-    """计算极角 theta = atan2(z, x)，单位为弧度。"""
-    return np.arctan2(z, x)
-
-def in_main_body_np(x, y, z):
+def to_cartesian(r, theta, y):
     """
-    判断点是否落在主体扇环柱体内部（未扣除凹槽）。
+    扇形模型使用：
+        x = r cos(theta)
+        y = y
+        z = r sin(theta)
     """
-    r = np.sqrt(x**2 + z**2)
-    theta = angle_np(x, z)
+    x = r * torch.cos(theta)
+    z = r * torch.sin(theta)
+    return torch.cat([x, y, z], dim=1)
+
+def groove_rho_torch(x, z):
+    return torch.sqrt((x - x_groove) ** 2 + z ** 2 + 1e-30)
+
+def is_in_groove_void_torch(X):
+    """
+    判断点是否在凹槽空腔内部
+    """
+    x = X[:, 0:1]
+    y = X[:, 1:2]
+    z = X[:, 2:3]
+    rho = groove_rho_torch(x, z)
+    cond_r = rho <= R_groove
+    cond_y = (y >= y_groove_bottom) & (y <= y_groove_top)
+    return cond_r & cond_y
+
+def is_in_main_sector_torch(X):
+    """
+    判断点是否在主体扇环柱内部（未扣除凹槽）
+    """
+    x = X[:, 0:1]
+    y = X[:, 1:2]
+    z = X[:, 2:3]
+
+    r = torch.sqrt(x**2 + z**2 + 1e-30)
+    theta = torch.atan2(z, x)
+
     cond_r = (r >= R_inner) & (r <= R_outer)
     cond_t = (theta >= theta_min) & (theta <= theta_max)
     cond_y = (y >= 0.0) & (y <= H_total)
     return cond_r & cond_t & cond_y
 
-def in_groove_void_np(x, y, z):
-    """
-    判断点是否落在凹槽空腔内部（被挖去的体积）。
-    凹槽定义：sqrt((x-x_groove)^2 + z^2) <= R_groove 且 y in [0.05, 0.07]
-    """
-    rho_g = np.sqrt((x - x_groove)**2 + z**2)
-    cond_rho = rho_g <= R_groove
-    cond_y = (y >= y_groove_bottom) & (y <= y_groove_top)
-    return cond_rho & cond_y
+def is_in_solid_torch(X):
+    return is_in_main_sector_torch(X) & (~is_in_groove_void_torch(X))
 
-def in_solid_np(x, y, z):
-    """
-    判断点是否落在最终计算域（实体域）内。
-    """
-    return in_main_body_np(x, y, z) & (~in_groove_void_np(x, y, z))
+# =========================================================
+# 7. 数据采样（保持模板 get_samples 架构）
+# 返回 7 组点，保持模板整体结构不变
+#
+# X_col          : 内部配点
+# X_bottom_load  : 底面受力边界
+# X_groove_bottom_fix : 凹槽底面固定边界
+# X_groove_side_free  : 凹槽侧壁自由边界
+# X_side_free    : 内外圆柱侧面自由边界
+# X_top_free     : 上表面自由边界（去掉凹槽开口）
+# X_radial_free  : 两个扇形径向侧面自由边界
+# =========================================================
+def sample_interior_points(N_col):
+    pts_list = []
+    total = 0
+    while total < N_col:
+        m = max(2 * (N_col - total), 1024)
+        raw = lhs_tensor(3, m)
 
-def sample_sector_annulus(n, y_value):
-    """
-    在扇环面上均匀采样点（面积均匀），y 固定。
-    适用于底面 y=0 的 Neumann 边界采样。
-    """
-    theta = np.random.uniform(theta_min, theta_max, size=(n,))
-    r = np.sqrt(np.random.uniform(R_inner**2, R_outer**2, size=(n,)))
-    x = r * np.cos(theta)
-    z = r * np.sin(theta)
-    y = np.full_like(x, fill_value=y_value)
-    pts = np.stack([x, y, z], axis=1)
-    return pts
+        r = torch.sqrt(raw[:, 0:1] * (R_outer**2 - R_inner**2) + R_inner**2)
+        theta = theta_min + raw[:, 1:2] * (theta_max - theta_min)
+        y = raw[:, 2:3] * H_total
 
-def sample_interior(n):
+        X = to_cartesian(r, theta, y)
+        mask = is_in_solid_torch(X).squeeze(1)
+        X_ok = X[mask]
+
+        pts_list.append(X_ok)
+        total += X_ok.shape[0]
+
+    X_col = torch.cat(pts_list, dim=0)[:N_col]
+    return X_col.requires_grad_(True)
+
+def sample_groove_edge_interior_points(N_edge):
     """
-    在实体内部均匀采样，完全避开凹槽区域。
-    采样方式：先在主体扇环柱体中随机采样，再剔除凹槽空腔点。
+    Interior collocation points concentrated near the re-entrant groove bottom
+    edge: rho ~= R_groove, y ~= y_groove_bottom. This is where the stress field
+    changes fastest, so uniform interior sampling under-resolves it.
     """
     pts_list = []
-    count = 0
-    while count < n:
-        m = max(2 * (n - count), 512)
-        theta = np.random.uniform(theta_min, theta_max, size=(m,))
-        r = np.sqrt(np.random.uniform(R_inner**2, R_outer**2, size=(m,)))
-        y = np.random.uniform(0.0, H_total, size=(m,))
-        x = r * np.cos(theta)
-        z = r * np.sin(theta)
+    total = 0
+    radial_span = 0.008
+    vertical_span = 0.006
 
-        mask = in_solid_np(x, y, z)
-        accepted = np.stack([x[mask], y[mask], z[mask]], axis=1)
-        pts_list.append(accepted)
-        count += accepted.shape[0]
+    while total < N_edge:
+        m = max(4 * (N_edge - total), 1024)
+        raw = lhs_tensor(3, m)
 
-    pts = np.concatenate(pts_list, axis=0)[:n]
-    return pts
+        alpha = 2.0 * np.pi * raw[:, 0:1]
+        rho = R_groove + (2.0 * raw[:, 1:2] - 1.0) * radial_span
+        y = y_groove_bottom + (2.0 * raw[:, 2:3] - 1.0) * vertical_span
 
-def sample_groove_bottom(n):
+        x = x_groove + rho * torch.cos(alpha)
+        z = rho * torch.sin(alpha)
+        X = torch.cat([x, y, z], dim=1)
+
+        mask = is_in_solid_torch(X).squeeze(1)
+        X_ok = X[mask]
+
+        pts_list.append(X_ok)
+        total += X_ok.shape[0]
+
+    X_edge = torch.cat(pts_list, dim=0)[:N_edge]
+    return X_edge.requires_grad_(True)
+
+def sample_groove_influence_interior_points(N_inf):
     """
-    采样凹槽底面（Dirichlet 边界的一部分）：
-    y = 0.05，且以 (x_groove, 0, 0) 为圆心的圆盘。
-    """
-    pts_list = []
-    count = 0
-    while count < n:
-        m = max(2 * (n - count), 256)
-        alpha = np.random.uniform(0.0, 2.0 * np.pi, size=(m,))
-        rho = np.sqrt(np.random.uniform(0.0, R_groove**2, size=(m,)))
-        x = x_groove + rho * np.cos(alpha)
-        z = rho * np.sin(alpha)
-        y = np.full_like(x, y_groove_bottom)
-
-        # 凹槽底面必须仍位于主体扇环投影内
-        mask = in_main_body_np(x, y, z)
-        accepted = np.stack([x[mask], y[mask], z[mask]], axis=1)
-        pts_list.append(accepted)
-        count += accepted.shape[0]
-
-    pts = np.concatenate(pts_list, axis=0)[:n]
-    return pts
-
-def sample_groove_side(n):
-    """
-    采样凹槽侧壁：
-    sqrt((x-x_groove)^2 + z^2) = R_groove, y in [0.05, 0.07]
+    Interior PDE points in a wider annular influence zone around the groove.
+    The narrow edge sampler captures the peak, while this sampler helps the
+    network learn the stress diffusion path from the groove into the body.
     """
     pts_list = []
-    count = 0
-    while count < n:
-        m = max(2 * (n - count), 256)
-        alpha = np.random.uniform(0.0, 2.0 * np.pi, size=(m,))
-        y = np.random.uniform(y_groove_bottom, y_groove_top, size=(m,))
-        x = x_groove + R_groove * np.cos(alpha)
-        z = R_groove * np.sin(alpha)
+    total = 0
+    rho_min = R_groove
+    rho_max = min(0.135, R_outer - x_groove + 0.035)
+    y_min = max(0.0, y_groove_bottom - 0.035)
+    y_max = H_total
 
-        mask = in_main_body_np(x, y, z)
-        accepted = np.stack([x[mask], y[mask], z[mask]], axis=1)
-        pts_list.append(accepted)
-        count += accepted.shape[0]
+    while total < N_inf:
+        m = max(4 * (N_inf - total), 1024)
+        raw = lhs_tensor(3, m)
 
-    pts = np.concatenate(pts_list, axis=0)[:n]
-    return pts
+        alpha = 2.0 * np.pi * raw[:, 0:1]
+        rho = rho_min + raw[:, 1:2] * (rho_max - rho_min)
+        y = y_min + raw[:, 2:3] * (y_max - y_min)
 
-def sample_dirichlet_groove_bottom_boundary(n):
-    """
-    采样凹槽底面固定边界。
-    当前设定中仅凹槽底面施加零位移约束，凹槽侧壁属于自由面。
-    """
-    return sample_groove_bottom(n)
+        x = x_groove + rho * torch.cos(alpha)
+        z = rho * torch.sin(alpha)
+        X = torch.cat([x, y, z], dim=1)
 
-def sample_groove_bottom_edge_band(n, band_width=edge_surface_band):
-    """
-    在凹槽底面靠近底缘圆环处加密采样。
-    用于固定边界与后处理中的局部边缘评估。
-    """
-    band_width = min(max(band_width, 1.0e-6), R_groove)
-    rho_min = max(R_groove - band_width, 0.0)
+        mask = is_in_solid_torch(X).squeeze(1)
+        X_ok = X[mask]
 
+        pts_list.append(X_ok)
+        total += X_ok.shape[0]
+
+    X_inf = torch.cat(pts_list, dim=0)[:N_inf]
+    return X_inf.requires_grad_(True)
+
+def sample_bottom_loaded(N_b):
+    raw = lhs_tensor(2, N_b)
+    r = torch.sqrt(raw[:, 0:1] * (R_outer**2 - R_inner**2) + R_inner**2)
+    theta = theta_min + raw[:, 1:2] * (theta_max - theta_min)
+    y = torch.zeros((N_b, 1), dtype=DTYPE, device=device)
+    X = to_cartesian(r, theta, y)
+    return X.requires_grad_(True)
+
+def sample_groove_bottom(Nb):
     pts_list = []
-    count = 0
-    while count < n:
-        m = max(2 * (n - count), 256)
-        alpha = np.random.uniform(0.0, 2.0 * np.pi, size=(m,))
-        rho = np.sqrt(np.random.uniform(rho_min**2, R_groove**2, size=(m,)))
-        x = x_groove + rho * np.cos(alpha)
-        z = rho * np.sin(alpha)
-        y = np.full_like(x, y_groove_bottom)
+    total = 0
+    while total < Nb:
+        m = max(2 * (Nb - total), 256)
+        raw = lhs_tensor(2, m)
+        rho = torch.sqrt(raw[:, 0:1]) * R_groove
+        alpha = 2.0 * np.pi * raw[:, 1:2]
 
-        mask = in_main_body_np(x, y, z)
-        accepted = np.stack([x[mask], y[mask], z[mask]], axis=1)
-        pts_list.append(accepted)
-        count += accepted.shape[0]
+        x = x_groove + rho * torch.cos(alpha)
+        z = rho * torch.sin(alpha)
+        y = torch.full((m, 1), y_groove_bottom, dtype=DTYPE, device=device)
+        X = torch.cat([x, y, z], dim=1)
 
-    pts = np.concatenate(pts_list, axis=0)[:n]
-    return pts
+        mask = is_in_main_sector_torch(X).squeeze(1)
+        X_ok = X[mask]
 
-def sample_groove_side_edge_band(n, height_span=edge_surface_band):
-    """
-    在凹槽侧壁靠近底缘处加密采样。
-    用于自由边界与后处理中的局部边缘评估。
-    """
-    height_span = min(max(height_span, 1.0e-6), groove_depth)
-    y_upper = min(y_groove_bottom + height_span, y_groove_top)
+        pts_list.append(X_ok)
+        total += X_ok.shape[0]
 
+    X = torch.cat(pts_list, dim=0)[:Nb]
+    return X
+
+def sample_groove_side(Ns):
     pts_list = []
-    count = 0
-    while count < n:
-        m = max(2 * (n - count), 256)
-        alpha = np.random.uniform(0.0, 2.0 * np.pi, size=(m,))
-        y = np.random.uniform(y_groove_bottom, y_upper, size=(m,))
-        x = x_groove + R_groove * np.cos(alpha)
-        z = R_groove * np.sin(alpha)
+    total = 0
+    while total < Ns:
+        m = max(2 * (Ns - total), 256)
+        raw = lhs_tensor(2, m)
+        alpha = 2.0 * np.pi * raw[:, 0:1]
+        y = y_groove_bottom + raw[:, 1:2] * (y_groove_top - y_groove_bottom)
 
-        mask = in_main_body_np(x, y, z)
-        accepted = np.stack([x[mask], y[mask], z[mask]], axis=1)
-        pts_list.append(accepted)
-        count += accepted.shape[0]
+        x = x_groove + R_groove * torch.cos(alpha)
+        z = R_groove * torch.sin(alpha)
+        X = torch.cat([x, y, z], dim=1)
 
-    pts = np.concatenate(pts_list, axis=0)[:n]
-    return pts
+        mask = is_in_main_sector_torch(X).squeeze(1)
+        X_ok = X[mask]
 
-def sample_free_groove_side_surface(n):
+        pts_list.append(X_ok)
+        total += X_ok.shape[0]
+
+    X = torch.cat(pts_list, dim=0)[:Ns]
+    return X
+
+def sample_groove_bottom_fixed(N_fix):
     """
-    采样凹槽侧壁自由面。
-    对实体域而言，凹槽侧壁的外法向指向凹槽空腔内部：
-    n = (-(x-x_groove)/R_groove, 0, -z/R_groove)。
+    固定边界仅为凹槽底面 y = y_groove_bottom。
     """
-    pts = sample_groove_side(n)
-    rho = np.sqrt((pts[:, 0] - x_groove)**2 + pts[:, 2]**2)
-    normals = np.stack([
-        -(pts[:, 0] - x_groove) / rho,
-        np.zeros_like(rho),
-        -pts[:, 2] / rho
-    ], axis=1)
-    return pts, normals
+    X = sample_groove_bottom(N_fix)
+    return X.requires_grad_(True)
 
-def sample_free_groove_side_edge_surface(n, height_span=edge_surface_band):
+def sample_groove_side_free(Ns):
     """
-    采样凹槽侧壁靠近底缘处的自由面，并返回外法向。
+    凹槽侧壁自由边界：
+    sqrt((x-x_groove)^2 + z^2) = R_groove, y in [y_groove_bottom, y_groove_top]
     """
-    pts = sample_groove_side_edge_band(n, height_span=height_span)
-    rho = np.sqrt((pts[:, 0] - x_groove)**2 + pts[:, 2]**2)
-    normals = np.stack([
-        -(pts[:, 0] - x_groove) / rho,
-        np.zeros_like(rho),
-        -pts[:, 2] / rho
-    ], axis=1)
-    return pts, normals
+    X = sample_groove_side(Ns)
+    return X.requires_grad_(True)
 
-def sample_interior_groove_edge_neighborhood(
-    n,
-    radial_span=edge_refine_radius,
-    vertical_span=edge_refine_height
-):
+def sample_side_free(N_side):
     """
-    在凹槽底缘附近的实体内部加密采样。
-    这里围绕交线 rho=R_groove, y=y_groove_bottom 构造局部邻域，
-    再剔除空腔点，仅保留实体内部点。
+    内外圆柱面自由边界
     """
-    radial_span = min(max(radial_span, 1.0e-6), 0.5 * R_groove)
-    vertical_span = min(max(vertical_span, 1.0e-6), max(y_groove_bottom, H_total - y_groove_bottom))
+    N_each = N_side // 2
 
-    pts_list = []
-    count = 0
-    while count < n:
-        m = max(4 * (n - count), 512)
-        alpha = np.random.uniform(0.0, 2.0 * np.pi, size=(m,))
+    raw_out = lhs_tensor(2, N_each)
+    theta_out = theta_min + raw_out[:, 0:1] * (theta_max - theta_min)
+    y_out = raw_out[:, 1:2] * H_total
+    r_out = torch.full((N_each, 1), R_outer, dtype=DTYPE, device=device)
+    X_outer = to_cartesian(r_out, theta_out, y_out)
 
-        dr = np.random.normal(loc=0.0, scale=0.35 * radial_span, size=(m,))
-        dy = np.random.normal(loc=0.0, scale=0.35 * vertical_span, size=(m,))
-        dr = np.clip(dr, -radial_span, radial_span)
-        dy = np.clip(dy, -vertical_span, vertical_span)
+    raw_in = lhs_tensor(2, N_side - N_each)
+    theta_in = theta_min + raw_in[:, 0:1] * (theta_max - theta_min)
+    y_in = raw_in[:, 1:2] * H_total
+    r_in = torch.full((N_side - N_each, 1), R_inner, dtype=DTYPE, device=device)
+    X_inner = to_cartesian(r_in, theta_in, y_in)
 
-        rho = R_groove + dr
-        x = x_groove + rho * np.cos(alpha)
-        z = rho * np.sin(alpha)
-        y = y_groove_bottom + dy
+    X = torch.cat([X_outer, X_inner], dim=0)
+    return X.requires_grad_(True)
 
-        mask = in_solid_np(x, y, z)
-        accepted = np.stack([x[mask], y[mask], z[mask]], axis=1)
-        pts_list.append(accepted)
-        count += accepted.shape[0]
-
-    pts = np.concatenate(pts_list, axis=0)[:n]
-    return pts
-
-def sample_free_top_surface(n):
+def sample_top_free(N_top):
     """
-    采样自由上表面：
-    y = H_total 的扇环顶面，扣除凹槽开口圆盘区域。
-    外法向 n = (0, 1, 0)。
+    上表面 y=H_total，自由边界，但需剔除凹槽开口
     """
     pts_list = []
-    normals_list = []
-    count = 0
-    while count < n:
-        m = max(2 * (n - count), 256)
-        pts = sample_sector_annulus(m, y_value=H_total)
-        x = pts[:, 0]
-        y = pts[:, 1]
-        z = pts[:, 2]
+    total = 0
+    while total < N_top:
+        m = max(2 * (N_top - total), 512)
+        raw = lhs_tensor(2, m)
+        r = torch.sqrt(raw[:, 0:1] * (R_outer**2 - R_inner**2) + R_inner**2)
+        theta = theta_min + raw[:, 1:2] * (theta_max - theta_min)
+        y = torch.full((m, 1), H_total, dtype=DTYPE, device=device)
 
-        # 顶面中被凹槽开口占据的圆盘不是实体自由外表面，需剔除。
-        rho_g = np.sqrt((x - x_groove)**2 + z**2)
-        mask = rho_g > R_groove
-        accepted = pts[mask]
-        normals = np.zeros_like(accepted)
-        normals[:, 1] = 1.0
+        X = to_cartesian(r, theta, y)
 
-        pts_list.append(accepted)
-        normals_list.append(normals)
-        count += accepted.shape[0]
+        # 顶面固体区域要去掉凹槽开口
+        mask = is_in_solid_torch(X).squeeze(1)
+        X_ok = X[mask]
 
-    pts = np.concatenate(pts_list, axis=0)[:n]
-    normals = np.concatenate(normals_list, axis=0)[:n]
-    return pts, normals
+        pts_list.append(X_ok)
+        total += X_ok.shape[0]
 
-def sample_free_outer_cylindrical_surface(n):
+    X = torch.cat(pts_list, dim=0)[:N_top]
+    return X.requires_grad_(True)
+
+def sample_radial_free(N_rad):
     """
-    采样外圆柱自由面：
-    r = R_outer, theta in [theta_min, theta_max], y in [0, H_total]。
-    外法向 n = (cos(theta), 0, sin(theta))。
+    两个扇形径向侧面：theta = ±theta_half
+    这里不需要递归补点，也不需要用 is_in_solid_torch 过滤。
+    原因：凹槽不会与这两个径向侧面相交。
     """
-    theta = np.random.uniform(theta_min, theta_max, size=(n,))
-    y = np.random.uniform(0.0, H_total, size=(n,))
-    x = R_outer * np.cos(theta)
-    z = R_outer * np.sin(theta)
+    N_rad = int(N_rad)
+    if N_rad <= 0:
+        return torch.empty((0, 3), dtype=DTYPE, device=device, requires_grad=True)
 
-    pts = np.stack([x, y, z], axis=1)
-    normals = np.stack([np.cos(theta), np.zeros_like(theta), np.sin(theta)], axis=1)
-    return pts, normals
+    N_each = N_rad // 2
+    N_rem = N_rad - N_each
 
-def sample_free_inner_cylindrical_surface(n):
+    # theta = theta_min 面
+    raw1 = lhs_tensor(2, N_each)
+    if N_each > 0:
+        r1 = torch.sqrt(raw1[:, 0:1] * (R_outer**2 - R_inner**2) + R_inner**2)
+        y1 = raw1[:, 1:2] * H_total
+        th1 = torch.full((N_each, 1), theta_min, dtype=DTYPE, device=device)
+        X1 = to_cartesian(r1, th1, y1)
+    else:
+        X1 = torch.empty((0, 3), dtype=DTYPE, device=device)
+
+    # theta = theta_max 面
+    raw2 = lhs_tensor(2, N_rem)
+    if N_rem > 0:
+        r2 = torch.sqrt(raw2[:, 0:1] * (R_outer**2 - R_inner**2) + R_inner**2)
+        y2 = raw2[:, 1:2] * H_total
+        th2 = torch.full((N_rem, 1), theta_max, dtype=DTYPE, device=device)
+        X2 = to_cartesian(r2, th2, y2)
+    else:
+        X2 = torch.empty((0, 3), dtype=DTYPE, device=device)
+
+    X = torch.cat([X1, X2], dim=0)
+    return X.requires_grad_(True)
+
+def is_in_main_sector_torch(X):
     """
-    采样内圆柱自由面：
-    r = R_inner, theta in [theta_min, theta_max], y in [0, H_total]。
-    对扇环实体而言，内圆柱面的外法向指向半径减小方向：
-    n = (-cos(theta), 0, -sin(theta))。
+    判断点是否在主体扇环柱内部（未扣除凹槽）
     """
-    theta = np.random.uniform(theta_min, theta_max, size=(n,))
-    y = np.random.uniform(0.0, H_total, size=(n,))
-    x = R_inner * np.cos(theta)
-    z = R_inner * np.sin(theta)
+    EPS = 1e-10
 
-    pts = np.stack([x, y, z], axis=1)
-    normals = np.stack([-np.cos(theta), np.zeros_like(theta), -np.sin(theta)], axis=1)
-    return pts, normals
+    x = X[:, 0:1]
+    y = X[:, 1:2]
+    z = X[:, 2:3]
 
-def sample_free_radial_side_surface(n, theta_value):
-    """
-    采样两侧径向自由面：
-    theta = theta_min 或 theta_max, r in [R_inner, R_outer], y in [0, H_total]。
-    theta = theta_max 时外法向为 e_theta = (-sin(theta), 0, cos(theta))；
-    theta = theta_min 时外法向为 -e_theta = (sin(theta), 0, -cos(theta))。
-    """
-    r = np.random.uniform(R_inner, R_outer, size=(n,))
-    y = np.random.uniform(0.0, H_total, size=(n,))
-    theta = np.full_like(r, fill_value=theta_value)
-    x = r * np.cos(theta)
-    z = r * np.sin(theta)
+    r = torch.sqrt(x**2 + z**2 + 1e-30)
+    theta = torch.atan2(z, x)
 
-    pts = np.stack([x, y, z], axis=1)
-    sign = 1.0 if theta_value > 0.0 else -1.0
-    normals = sign * np.stack([-np.sin(theta), np.zeros_like(theta), np.cos(theta)], axis=1)
-    return pts, normals
+    cond_r = (r >= R_inner - EPS) & (r <= R_outer + EPS)
+    cond_t = (theta >= theta_min - EPS) & (theta <= theta_max + EPS)
+    cond_y = (y >= 0.0 - EPS) & (y <= H_total + EPS)
+    return cond_r & cond_t & cond_y
 
-def sample_free_surface_boundary(n):
-    """
-    采样除底面受力边界与凹槽底面固支边界之外的其余自由外表面，并返回对应外法向。
-    自由面包括：
-    - 顶面 y=H_total，扣除凹槽开口；
-    - 凹槽侧壁；
-    - 外圆柱面 r=R_outer；
-    - 内圆柱面 r=R_inner；
-    - 两个径向侧面 theta=theta_min/theta_max。
-    """
-    groove_opening_area = np.pi * R_groove**2
-    groove_side_area = 2.0 * np.pi * R_groove * groove_depth
-    top_area = bottom_area - groove_opening_area
-    outer_area = R_outer * (theta_max - theta_min) * H_total
-    inner_area = R_inner * (theta_max - theta_min) * H_total
-    radial_side_area = (R_outer - R_inner) * H_total
+def get_samples():
+    N_col_uniform = 22000
+    N_col_influence = 8000
+    N_col_edge = 6000
+    N_b = 4000
+    N_fix = 4000
+    N_groove_side = 4000
+    N_rad = 4000
 
-    areas = np.array([
-        top_area,
-        groove_side_area,
-        outer_area,
-        inner_area,
-        radial_side_area,
-        radial_side_area
-    ], dtype=np.float64)
-    areas = np.maximum(areas, 0.0)
-    counts = np.floor(n * areas / np.sum(areas)).astype(int)
-    counts[-1] += n - int(np.sum(counts))
+    X_col_uniform = sample_interior_points(N_col_uniform)
+    X_col_influence = sample_groove_influence_interior_points(N_col_influence)
+    X_col_edge = sample_groove_edge_interior_points(N_col_edge)
+    X_col = torch.cat([X_col_uniform, X_col_influence, X_col_edge], dim=0).requires_grad_(True)
+    X_bottom_load = sample_bottom_loaded(N_b)
+    X_groove_bottom_fix = sample_groove_bottom_fixed(N_fix)
+    X_groove_side_free = sample_groove_side_free(N_groove_side)
+    X_side_free = sample_side_free(N_b)
+    X_top_free = sample_top_free(N_b)
+    X_radial_free = sample_radial_free(N_rad)
 
-    samplers = [
-        lambda count: sample_free_top_surface(count),
-        lambda count: sample_free_groove_side_surface(count),
-        lambda count: sample_free_outer_cylindrical_surface(count),
-        lambda count: sample_free_inner_cylindrical_surface(count),
-        lambda count: sample_free_radial_side_surface(count, theta_min),
-        lambda count: sample_free_radial_side_surface(count, theta_max),
-    ]
-
-    pts_parts = []
-    normal_parts = []
-    for count, sampler in zip(counts, samplers):
-        if count <= 0:
-            continue
-        pts_i, normals_i = sampler(int(count))
-        pts_parts.append(pts_i)
-        normal_parts.append(normals_i)
-
-    pts = np.concatenate(pts_parts, axis=0)
-    normals = np.concatenate(normal_parts, axis=0)
-
-    idx = np.random.permutation(pts.shape[0])
-    return pts[idx], normals[idx]
-
-def to_tensor(x_np):
-    return torch.tensor(x_np, dtype=dtype, device=device)
-
-def shuffle_points_np(pts):
-    if pts.shape[0] <= 1:
-        return pts
-    idx = np.random.permutation(pts.shape[0])
-    return pts[idx]
-
-def shuffle_points_with_normals_np(pts, normals):
-    if pts.shape[0] <= 1:
-        return pts, normals
-    idx = np.random.permutation(pts.shape[0])
-    return pts[idx], normals[idx]
-
-# ============================================================
-# 3. SIREN 神经网络模块
-# ============================================================
-
-class SineLayer(nn.Module):
-    """
-    SIREN 的正弦激活层。
-    """
-    def __init__(self, in_features, out_features, bias=True, is_first=False, omega_0=30.0):
-        super().__init__()
-        self.in_features = in_features
-        self.is_first = is_first
-        self.omega_0 = omega_0
-        self.linear = nn.Linear(in_features, out_features, bias=bias)
-        self.init_weights()
-
-    def init_weights(self):
-        with torch.no_grad():
-            if self.is_first:
-                # SIREN 首层初始化
-                self.linear.weight.uniform_(-1.0 / self.in_features, 1.0 / self.in_features)
-            else:
-                # SIREN 隐层初始化
-                bound = np.sqrt(6.0 / self.in_features) / self.omega_0
-                self.linear.weight.uniform_(-bound, bound)
-            if self.linear.bias is not None:
-                self.linear.bias.fill_(0.0)
-
-    def forward(self, x):
-        return torch.sin(self.omega_0 * self.linear(x))
-
-class SirenNet(nn.Module):
-    """
-    输入：三维坐标 (x, y, z)，单位仍为 m
-    输出：三个位移分量 + 六个应力分量，单位仍为 m 和 Pa
-    说明：
-    1) 前向内部仅做“数值归一化”，不改变物理定义；
-    2) 位移输出乘 U_ref，应力输出乘 T_ref，以提高训练初期的数值稳定性。
-    """
-    def __init__(self,
-                 in_features=3,
-                 hidden_features=128,
-                 hidden_layers=5,
-                 out_features=3,
-                 first_omega_0=30.0,
-                 hidden_omega_0=30.0):
-        super().__init__()
-
-        layers = []
-        layers.append(SineLayer(in_features, hidden_features,
-                                is_first=True, omega_0=first_omega_0))
-
-        for _ in range(hidden_layers):
-            layers.append(SineLayer(hidden_features, hidden_features,
-                                    is_first=False, omega_0=hidden_omega_0))
-
-        final_linear = nn.Linear(hidden_features, out_features)
-        with torch.no_grad():
-            bound = np.sqrt(6.0 / hidden_features) / hidden_omega_0
-            final_linear.weight.uniform_(-bound, bound)
-            final_linear.bias.fill_(0.0)
-
-        layers.append(final_linear)
-        self.net = nn.Sequential(*layers)
-
-    def normalize_coords(self, x):
-        """
-        将坐标缩放到近似 [-1, 1] 区间，减少 SIREN 的训练难度。
-        """
-        x_in = x.clone()
-        x_in[:, 0:1] = x[:, 0:1] / R_outer
-        x_in[:, 1:2] = 2.0 * x[:, 1:2] / H_total - 1.0
-        x_in[:, 2:3] = x[:, 2:3] / R_outer
-        return x_in
-
-    def forward(self, x):
-        x_in = self.normalize_coords(x)
-        y_hat = self.net(x_in)
-        disp_phys = U_ref * y_hat[:, 0:3]
-        stress_phys = T_ref * y_hat[:, 3:9]
-        return torch.cat([disp_phys, stress_phys], dim=1)
-
-# ============================================================
-# 4. PDE 残差与应力应变模块
-# ============================================================
-
-def gradients(y, x, create_graph=True):
-    """
-    计算 dy/dx，y 必须是 shape=(N,1)。
-    """
-    return torch.autograd.grad(
-        y, x,
-        grad_outputs=torch.ones_like(y),
-        create_graph=create_graph,
-        retain_graph=True,
-        only_inputs=True
-    )[0]
-
-def kinematics_and_stress(points, model, create_graph=True):
-    """
-    给定空间点 points，返回：
-    - 位移 u,v,w
-    - 应变 eps_xx, eps_yy, eps_zz, eps_xy, eps_yz, eps_xz
-    - 网络应力 sxx, syy, szz, sxy, syz, sxz
-    - 本构应力 sxx_const, syy_const, szz_const, sxy_const, syz_const, sxz_const
-    """
-    points = points.clone().detach().requires_grad_(True)
-    pred = model(points)
-
-    u = pred[:, 0:1]
-    v = pred[:, 1:2]
-    w = pred[:, 2:3]
-
-    sxx = pred[:, 3:4]
-    syy = pred[:, 4:5]
-    szz = pred[:, 5:6]
-    sxy = pred[:, 6:7]
-    syz = pred[:, 7:8]
-    sxz = pred[:, 8:9]
-
-    grad_u = gradients(u, points, create_graph=create_graph)
-    grad_v = gradients(v, points, create_graph=create_graph)
-    grad_w = gradients(w, points, create_graph=create_graph)
-
-    du_dx, du_dy, du_dz = grad_u[:, 0:1], grad_u[:, 1:2], grad_u[:, 2:3]
-    dv_dx, dv_dy, dv_dz = grad_v[:, 0:1], grad_v[:, 1:2], grad_v[:, 2:3]
-    dw_dx, dw_dy, dw_dz = grad_w[:, 0:1], grad_w[:, 1:2], grad_w[:, 2:3]
-
-    # 小变形应变张量
-    eps_xx = du_dx
-    eps_yy = dv_dy
-    eps_zz = dw_dz
-    eps_xy = 0.5 * (du_dy + dv_dx)
-    eps_yz = 0.5 * (dv_dz + dw_dy)
-    eps_xz = 0.5 * (du_dz + dw_dx)
-
-    trace_eps = eps_xx + eps_yy + eps_zz
-
-    # 由位移梯度得到的本构应力，用于约束网络应力。
-    sxx_const = lam * trace_eps + 2.0 * mu * eps_xx
-    syy_const = lam * trace_eps + 2.0 * mu * eps_yy
-    szz_const = lam * trace_eps + 2.0 * mu * eps_zz
-    sxy_const = 2.0 * mu * eps_xy
-    syz_const = 2.0 * mu * eps_yz
-    sxz_const = 2.0 * mu * eps_xz
-
-    return {
-        "points": points,
-        "u": u, "v": v, "w": w,
-        "eps_xx": eps_xx, "eps_yy": eps_yy, "eps_zz": eps_zz,
-        "eps_xy": eps_xy, "eps_yz": eps_yz, "eps_xz": eps_xz,
-        "sxx": sxx, "syy": syy, "szz": szz,
-        "sxy": sxy, "syz": syz, "sxz": sxz,
-        "sxx_const": sxx_const, "syy_const": syy_const, "szz_const": szz_const,
-        "sxy_const": sxy_const, "syz_const": syz_const, "sxz_const": sxz_const
-    }
-
-def pde_residual(points, model):
-    """
-    线弹性平衡方程：div(sigma) = 0
-    返回三个方向的平衡残差：
-    rx = dsxx/dx + dsxy/dy + dsxz/dz
-    ry = dsxy/dx + dsyy/dy + dsyz/dz
-    rz = dsxz/dx + dsyz/dy + dszz/dz
-    """
-    out = kinematics_and_stress(points, model, create_graph=True)
-    pts = out["points"]
-
-    sxx, syy, szz = out["sxx"], out["syy"], out["szz"]
-    sxy, syz, sxz = out["sxy"], out["syz"], out["sxz"]
-
-    grad_sxx = gradients(sxx, pts, create_graph=True)
-    grad_syy = gradients(syy, pts, create_graph=True)
-    grad_szz = gradients(szz, pts, create_graph=True)
-    grad_sxy = gradients(sxy, pts, create_graph=True)
-    grad_syz = gradients(syz, pts, create_graph=True)
-    grad_sxz = gradients(sxz, pts, create_graph=True)
-
-    rx = grad_sxx[:, 0:1] + grad_sxy[:, 1:2] + grad_sxz[:, 2:3]
-    ry = grad_sxy[:, 0:1] + grad_syy[:, 1:2] + grad_syz[:, 2:3]
-    rz = grad_sxz[:, 0:1] + grad_syz[:, 1:2] + grad_szz[:, 2:3]
-
-    return rx, ry, rz
-
-def energy_balance_loss(x_energy, x_neu, model):
-    """
-    能量形式损失：
-    采用线弹性下的 Clapeyron 定理约束：
-        ∫ 0.5 * sigma:epsilon dV = 0.5 * ∫ t·u dS
-
-    - 内应变能密度：0.5 * sigma:epsilon
-    - 外力功密度（底面）：t · u
-
-    这里通过 Monte Carlo 积分近似体积分与面积分，
-    并将两者之差构造成无量纲损失。
-    说明：这里应使用“均匀体采样”的内部点，否则能量积分会因局部加密而偏置。
-    """
-    out_int = kinematics_and_stress(x_energy, model, create_graph=True)
-    strain_energy_density = 0.5 * (
-        out_int["sxx_const"] * out_int["eps_xx"] +
-        out_int["syy_const"] * out_int["eps_yy"] +
-        out_int["szz_const"] * out_int["eps_zz"] +
-        2.0 * out_int["sxy_const"] * out_int["eps_xy"] +
-        2.0 * out_int["syz_const"] * out_int["eps_yz"] +
-        2.0 * out_int["sxz_const"] * out_int["eps_xz"]
+    return (
+        X_col,
+        X_bottom_load,
+        X_groove_bottom_fix,
+        X_groove_side_free,
+        X_side_free,
+        X_top_free,
+        X_radial_free,
     )
-    internal_energy = solid_volume * torch.mean(strain_energy_density)
 
-    disp_neu = model(x_neu)[:, 0:3]
-    external_work_density = q_load * disp_neu[:, 1:2]
-    external_work = bottom_area * torch.mean(external_work_density)
+def print_sampling_info():
+    print("[INFO] train collocation samples:")
+    print("       uniform=22000, groove_influence=8000, groove_edge=6000")
+    print("       total interior=36000")
+    print("[INFO] validation collocation samples:")
+    print("       uniform=6500, groove_influence=2500, groove_edge=2000")
+    print("       total interior=11000")
 
-    energy_gap = internal_energy - 0.5 * external_work
-    loss_energy = (energy_gap / Energy_ref) ** 2
-    return loss_energy, internal_energy, external_work
+def get_validation_samples():
+    N_col_uniform = 6500
+    N_col_influence = 2500
+    N_col_edge = 2000
+    N_b = 1200
+    N_fix = 1200
+    N_groove_side = 1200
+    N_rad = 1200
 
-def bottom_traction_residual(points, model):
-    """
-    底面 y=0 的 Neumann 边界条件。
-    底面外法向量 n = (0, -1, 0)。
-    规定外部面力沿 +Y 方向，大小为 q_load，因此目标牵引向量为：
-        t = [0, q_load, 0]^T
-    而 sigma·n = [-sxy, -syy, -syz]^T
-    """
-    out = kinematics_and_stress(points, model, create_graph=True)
-    tx = -out["sxy"]
-    ty = -out["syy"]
-    tz = -out["syz"]
+    X_col_uniform = sample_interior_points(N_col_uniform)
+    X_col_influence = sample_groove_influence_interior_points(N_col_influence)
+    X_col_edge = sample_groove_edge_interior_points(N_col_edge)
+    X_col = torch.cat([X_col_uniform, X_col_influence, X_col_edge], dim=0).requires_grad_(True)
+    X_bottom_load = sample_bottom_loaded(N_b)
+    X_groove_bottom_fix = sample_groove_bottom_fixed(N_fix)
+    X_groove_side_free = sample_groove_side_free(N_groove_side)
+    X_side_free = sample_side_free(N_b)
+    X_top_free = sample_top_free(N_b)
+    X_radial_free = sample_radial_free(N_rad)
 
-    t_target_x = torch.zeros_like(tx)
-    t_target_y = torch.full_like(ty, q_load)
-    t_target_z = torch.zeros_like(tz)
+    return (
+        X_col,
+        X_bottom_load,
+        X_groove_bottom_fix,
+        X_groove_side_free,
+        X_side_free,
+        X_top_free,
+        X_radial_free,
+    )
 
-    rx = tx - t_target_x
-    ry = ty - t_target_y
-    rz = tz - t_target_z
-    return rx, ry, rz
+# =========================================================
+# 8. 模型定义（整体架构保持不变）
+# 仍然输出：
+# u, v, w, sxx, syy, szz, sxy, syz, sxz
+# =========================================================
+class PINN3D(nn.Module):
+    def __init__(self, layers):
+        super().__init__()
+        self.activation = nn.SiLU()
+        self.linears = nn.ModuleList(
+            [nn.Linear(layers[i], layers[i + 1]) for i in range(len(layers) - 1)]
+        )
 
-def surface_traction_residual(points, normals, model):
-    """
-    任意表面的牵引残差：
-        t = sigma · n
-    对自由表面，目标牵引为零，因此直接返回 tx, ty, tz。
-    """
-    out = kinematics_and_stress(points, model, create_graph=True)
-    nx = normals[:, 0:1]
-    ny = normals[:, 1:2]
-    nz = normals[:, 2:3]
+        for i in range(len(self.linears) - 1):
+            nn.init.xavier_normal_(self.linears[i].weight.data)
+            nn.init.zeros_(self.linears[i].bias.data)
 
-    tx = out["sxx"] * nx + out["sxy"] * ny + out["sxz"] * nz
-    ty = out["sxy"] * nx + out["syy"] * ny + out["syz"] * nz
-    tz = out["sxz"] * nx + out["syz"] * ny + out["szz"] * nz
+        nn.init.xavier_normal_(self.linears[-1].weight.data)
+        nn.init.zeros_(self.linears[-1].bias.data)
+
+    def forward(self, x_in):
+        a = 2.0 * (x_in - lb) / (ub - lb) - 1.0
+        for i in range(len(self.linears) - 1):
+            a = self.activation(self.linears[i](a))
+        out = self.linears[-1](a)
+
+        # 位移与应力采用不同参考尺度输出，避免网络在初始化阶段陷入“全零应力”解。
+        u = U_REF * out[:, 0:1]
+        v = U_REF * out[:, 1:2]
+        w = U_REF * out[:, 2:3]
+        sxx = SIGMA_REF * out[:, 3:4]
+        syy = SIGMA_REF * out[:, 4:5]
+        szz = SIGMA_REF * out[:, 5:6]
+        sxy = SIGMA_REF * out[:, 6:7]
+        syz = SIGMA_REF * out[:, 7:8]
+        sxz = SIGMA_REF * out[:, 8:9]
+        return u, v, w, sxx, syy, szz, sxy, syz, sxz
+
+# =========================================================
+# 9. 自适应权重（整体架构保持不变）
+# =========================================================
+class AdaptiveWeighter:
+    def __init__(self, num_losses, alpha=0.9):
+        self.weights = torch.ones(num_losses, dtype=DTYPE, device=device)
+        self.alpha = alpha
+
+    def update(self, model, losses):
+        last_layer = model.linears[-1].weight
+        grads_norm = []
+        for loss in losses:
+            grad = torch.autograd.grad(loss, last_layer, retain_graph=True)[0]
+            grad_norm = torch.mean(torch.abs(grad))
+            grads_norm.append(grad_norm)
+
+        grads_norm = torch.stack(grads_norm)
+
+        target_weights = grads_norm[0] / (grads_norm + 1e-10)
+        target_weights = torch.clamp(target_weights, min=0.01, max=100.0)
+        target_weights[0] = max(target_weights[0].item(), 1.0)
+
+        self.weights = self.alpha * self.weights + (1 - self.alpha) * target_weights.detach()
+        return self.weights
+
+# =========================================================
+# 10. Loss 计算
+# 六项损失结构不改，只替换成扇形模型对应含义
+# =========================================================
+def get_gradients(u, x):
+    return torch.autograd.grad(u, x, torch.ones_like(u), create_graph=True, retain_graph=True)[0]
+
+def traction_from_stress(sxx, syy, szz, sxy, syz, sxz, nx, ny, nz):
+    tx = sxx * nx + sxy * ny + sxz * nz
+    ty = sxy * nx + syy * ny + syz * nz
+    tz = sxz * nx + syz * ny + szz * nz
     return tx, ty, tz
-
-def von_mises_from_stress(sxx, syy, szz, sxy, syz, sxz):
-    """
-    3D von Mises 等效应力。
-    """
-    vm = torch.sqrt(
-        0.5 * ((sxx - syy)**2 + (syy - szz)**2 + (szz - sxx)**2)
-        + 3.0 * (sxy**2 + syz**2 + sxz**2)
-        + 1e-30
-    )
-    return vm
-
-# ============================================================
-# 5. 损失函数模块
-# ============================================================
 
 def compute_losses(
     model,
-    x_int,
-    x_edge,
-    x_energy,
-    x_dir,
-    x_dir_edge,
-    x_neu,
-    x_free,
-    n_free,
-    x_free_edge,
-    n_free_edge
+    X_col,
+    X_bottom_load,
+    X_groove_bottom_fix,
+    X_groove_side_free,
+    X_side_free,
+    X_top_free,
+    X_radial_free,
+    const_weight=None
 ):
-    """
-    总损失 = 控制方程损失 + 能量形式损失 + 各类边界损失
-    说明：
-    - PDE 残差缩放：T_ref / L_ref
-    - 能量损失缩放：Energy_ref
-    - Dirichlet 位移缩放：U_ref
-    - Neumann 与自由面牵引缩放：T_ref
-    这样做仅为改善训练数值条件，不改变物理单位。
-    """
-    # ---- PDE loss ----
-    rx_pde, ry_pde, rz_pde = pde_residual(x_int, model)
-    pde_scale = T_ref / L_ref
-    loss_pde = torch.mean(
-        (rx_pde / pde_scale)**2 +
-        (ry_pde / pde_scale)**2 +
-        (rz_pde / pde_scale)**2
-    )
+    if const_weight is None:
+        const_weight = w_const_pde_end
 
-    # ---- Local PDE loss near groove bottom edge ----
-    rx_edge, ry_edge, rz_edge = pde_residual(x_edge, model)
-    loss_pde_edge = torch.mean(
-        (rx_edge / pde_scale)**2 +
-        (ry_edge / pde_scale)**2 +
-        (rz_edge / pde_scale)**2
-    )
+    # -----------------------------------------------------
+    # 1. PDE Loss：平衡方程 + 本构方程
+    # -----------------------------------------------------
+    u, v, w, sxx, syy, szz, sxy, syz, sxz = model(X_col)
 
-    # ---- Energy loss ----
-    loss_energy, internal_energy, external_work = energy_balance_loss(x_energy, x_neu, model)
+    gu = get_gradients(u, X_col)
+    gv = get_gradients(v, X_col)
+    gw = get_gradients(w, X_col)
 
-    # ---- Constitutive consistency loss ----
-    out_const = kinematics_and_stress(x_int, model, create_graph=True)
-    loss_const = torch.mean(
-        ((out_const["sxx"] - out_const["sxx_const"]) / T_ref)**2 +
-        ((out_const["syy"] - out_const["syy_const"]) / T_ref)**2 +
-        ((out_const["szz"] - out_const["szz_const"]) / T_ref)**2 +
-        ((out_const["sxy"] - out_const["sxy_const"]) / T_ref)**2 +
-        ((out_const["syz"] - out_const["syz_const"]) / T_ref)**2 +
-        ((out_const["sxz"] - out_const["sxz_const"]) / T_ref)**2
-    )
+    ux, uy, uz = gu[:, 0:1], gu[:, 1:2], gu[:, 2:3]
+    vx, vy, vz = gv[:, 0:1], gv[:, 1:2], gv[:, 2:3]
+    wx, wy, wz = gw[:, 0:1], gw[:, 1:2], gw[:, 2:3]
 
-    # ---- Dirichlet loss（仅凹槽底面固支）----
-    u_dir = model(x_dir)[:, 0:3]
-    loss_dir = torch.mean((u_dir / U_ref)**2)
+    # 平衡方程 div(sigma)=0
+    gsxx = get_gradients(sxx, X_col)
+    gsyy = get_gradients(syy, X_col)
+    gszz = get_gradients(szz, X_col)
+    gsxy = get_gradients(sxy, X_col)
+    gsyz = get_gradients(syz, X_col)
+    gsxz = get_gradients(sxz, X_col)
 
-    # ---- Local Dirichlet loss near groove bottom edge ----
-    u_dir_edge = model(x_dir_edge)[:, 0:3]
-    loss_dir_edge = torch.mean((u_dir_edge / U_ref)**2)
+    res_x = gsxx[:, 0:1] + gsxy[:, 1:2] + gsxz[:, 2:3]
+    res_y = gsxy[:, 0:1] + gsyy[:, 1:2] + gsyz[:, 2:3]
+    res_z = gsxz[:, 0:1] + gsyz[:, 1:2] + gszz[:, 2:3]
 
-    # ---- Neumann loss（底面向上均布面力）----
-    rx_neu, ry_neu, rz_neu = bottom_traction_residual(x_neu, model)
-    loss_neu = torch.mean(
-        (rx_neu / T_ref)**2 +
-        (ry_neu / T_ref)**2 +
-        (rz_neu / T_ref)**2
-    )
+    # 本构方程
+    div_u = ux + vy + wz
 
-    # ---- Free surface loss（其余外表面零牵引）----
-    rx_free, ry_free, rz_free = surface_traction_residual(x_free, n_free, model)
-    loss_free = torch.mean(
-        (rx_free / T_ref)**2 +
-        (ry_free / T_ref)**2 +
-        (rz_free / T_ref)**2
-    )
+    sxx_c = lmda * div_u + 2.0 * mu * ux
+    syy_c = lmda * div_u + 2.0 * mu * vy
+    szz_c = lmda * div_u + 2.0 * mu * wz
+    sxy_c = mu * (uy + vx)
+    syz_c = mu * (vz + wy)
+    sxz_c = mu * (uz + wx)
 
-    # ---- Local free surface loss near groove side/bottom edge ----
-    rx_free_edge, ry_free_edge, rz_free_edge = surface_traction_residual(
-        x_free_edge,
-        n_free_edge,
-        model
-    )
-    loss_free_edge = torch.mean(
-        (rx_free_edge / T_ref)**2 +
-        (ry_free_edge / T_ref)**2 +
-        (rz_free_edge / T_ref)**2
-    )
+    loss_const = torch.mean(((sxx_c - sxx) / SIGMA_REF) ** 2) + \
+                 torch.mean(((syy_c - syy) / SIGMA_REF) ** 2) + \
+                 torch.mean(((szz_c - szz) / SIGMA_REF) ** 2) + \
+                 torch.mean(((sxy_c - sxy) / SIGMA_REF) ** 2) + \
+                 torch.mean(((syz_c - syz) / SIGMA_REF) ** 2) + \
+                 torch.mean(((sxz_c - sxz) / SIGMA_REF) ** 2)
 
-    loss_total = (
-        w_pde * loss_pde
-        + w_pde_edge * loss_pde_edge
-        + w_energy * loss_energy
-        + w_const * loss_const
-        + w_dir * loss_dir
-        + w_dir_edge * loss_dir_edge
-        + w_neu * loss_neu
-        + w_free * loss_free
-        + w_free_edge * loss_free_edge
-    )
+    loss_eq = torch.mean((res_x / PDE_REF) ** 2) + \
+              torch.mean((res_y / PDE_REF) ** 2) + \
+              torch.mean((res_z / PDE_REF) ** 2)
 
-    return loss_total, {
-        "loss_pde": loss_pde.detach(),
-        "loss_pde_edge": loss_pde_edge.detach(),
-        "loss_energy": loss_energy.detach(),
-        "loss_const": loss_const.detach(),
-        "loss_dir": loss_dir.detach(),
-        "loss_dir_edge": loss_dir_edge.detach(),
-        "loss_neu": loss_neu.detach(),
-        "loss_free": loss_free.detach(),
-        "loss_free_edge": loss_free_edge.detach(),
-        "internal_energy": internal_energy.detach(),
-        "external_work": external_work.detach(),
-        "loss_total": loss_total.detach()
-    }
+    loss_pde = w_eq_pde * loss_eq + const_weight * loss_const
 
-# ============================================================
-# 6. 训练流程模块
-# ============================================================
+    # -----------------------------------------------------
+    # 2. 底面受力边界（代替模板里的 inner pressure）
+    # y = 0, outward n = (0,-1,0)
+    # prescribed traction = (0, q_load, 0)
+    # -----------------------------------------------------
+    _, _, _, sxx_b, syy_b, szz_b, sxy_b, syz_b, sxz_b = model(X_bottom_load)
 
-def resample_training_points():
-    n_int_edge = min(int(round(N_int * edge_refine_ratio_int)), N_int)
-    n_int_bulk = N_int - n_int_edge
-    x_int_parts = []
-    if n_int_bulk > 0:
-        x_int_parts.append(sample_interior(n_int_bulk))
-    if n_int_edge > 0:
-        x_int_parts.append(sample_interior_groove_edge_neighborhood(n_int_edge))
-    x_int = to_tensor(shuffle_points_np(np.concatenate(x_int_parts, axis=0)))
+    nx_b = torch.zeros((X_bottom_load.shape[0], 1), dtype=DTYPE, device=device)
+    ny_b = -torch.ones((X_bottom_load.shape[0], 1), dtype=DTYPE, device=device)
+    nz_b = torch.zeros((X_bottom_load.shape[0], 1), dtype=DTYPE, device=device)
 
-    x_edge = to_tensor(sample_interior_groove_edge_neighborhood(N_edge))
-    x_energy = to_tensor(sample_interior(N_energy))
+    tx_b, ty_b, tz_b = traction_from_stress(sxx_b, syy_b, szz_b, sxy_b, syz_b, sxz_b, nx_b, ny_b, nz_b)
 
-    n_dir_edge = min(int(round(N_dir * edge_refine_ratio_dir)), N_dir)
-    n_dir_bulk = N_dir - n_dir_edge
-    x_dir_parts = []
-    if n_dir_bulk > 0:
-        x_dir_parts.append(sample_dirichlet_groove_bottom_boundary(n_dir_bulk))
-    if n_dir_edge > 0:
-        x_dir_parts.append(sample_groove_bottom_edge_band(n_dir_edge))
-    x_dir = to_tensor(shuffle_points_np(np.concatenate(x_dir_parts, axis=0)))
+    target_tx_b = torch.zeros_like(tx_b)
+    target_ty_b = torch.full_like(ty_b, q_load)
+    target_tz_b = torch.zeros_like(tz_b)
 
-    x_dir_edge = to_tensor(sample_groove_bottom_edge_band(N_dir_edge))
-    x_neu = to_tensor(sample_sector_annulus(N_neu, y_value=0.0))
+    loss_bottom_load = torch.mean(((tx_b - target_tx_b) / SIGMA_REF) ** 2 +
+                                  ((ty_b - target_ty_b) / SIGMA_REF) ** 2 +
+                                  ((tz_b - target_tz_b) / SIGMA_REF) ** 2)
+    mean_ty_ratio = torch.mean(ty_b) / q_load
+    loss_bottom_mean = (mean_ty_ratio - 1.0) ** 2
+    loss_bottom_load = loss_bottom_load + load_mean_weight * loss_bottom_mean
 
-    n_free_edge = min(int(round(N_free * edge_refine_ratio_free)), N_free)
-    n_free_bulk = N_free - n_free_edge
-    x_free_parts = []
-    n_free_parts = []
-    if n_free_bulk > 0:
-        x_free_bulk_np, n_free_bulk_np = sample_free_surface_boundary(n_free_bulk)
-        x_free_parts.append(x_free_bulk_np)
-        n_free_parts.append(n_free_bulk_np)
-    if n_free_edge > 0:
-        x_free_edge_np, n_free_edge_np = sample_free_groove_side_edge_surface(n_free_edge)
-        x_free_parts.append(x_free_edge_np)
-        n_free_parts.append(n_free_edge_np)
-    x_free_np = np.concatenate(x_free_parts, axis=0)
-    n_free_np = np.concatenate(n_free_parts, axis=0)
-    x_free_np, n_free_np = shuffle_points_with_normals_np(x_free_np, n_free_np)
+    # -----------------------------------------------------
+    # 3. 凹槽底面固定边界
+    # -----------------------------------------------------
+    u_fix, v_fix, w_fix, _, _, _, _, _, _ = model(X_groove_bottom_fix)
+    loss_groove_bottom_fixed = torch.mean((u_fix / U_REF) ** 2 +
+                                          (v_fix / U_REF) ** 2 +
+                                          (w_fix / U_REF) ** 2)
 
-    x_free = to_tensor(x_free_np)
-    n_free = to_tensor(n_free_np)
+    # -----------------------------------------------------
+    # 4. 凹槽侧壁自由边界
+    # rho = R_groove, outward n = ((x-x_groove)/rho, 0, z/rho)
+    # -----------------------------------------------------
+    _, _, _, sxx_g, syy_g, szz_g, sxy_g, syz_g, sxz_g = model(X_groove_side_free)
 
-    x_free_edge_np, n_free_edge_np = sample_free_groove_side_edge_surface(N_free_edge)
-    x_free_edge = to_tensor(x_free_edge_np)
-    n_free_edge = to_tensor(n_free_edge_np)
+    x_g = X_groove_side_free[:, 0:1]
+    z_g = X_groove_side_free[:, 2:3]
+    rho_g = torch.sqrt((x_g - x_groove) ** 2 + z_g ** 2 + 1e-30)
+
+    nx_g = (x_g - x_groove) / rho_g
+    ny_g = torch.zeros_like(nx_g)
+    nz_g = z_g / rho_g
+
+    tx_g, ty_g, tz_g = traction_from_stress(sxx_g, syy_g, szz_g, sxy_g, syz_g, sxz_g, nx_g, ny_g, nz_g)
+
+    loss_groove_side_free = torch.mean((tx_g / SIGMA_REF) ** 2 +
+                                       (ty_g / SIGMA_REF) ** 2 +
+                                       (tz_g / SIGMA_REF) ** 2)
+
+    # -----------------------------------------------------
+    # 5. 内外圆柱侧面自由边界
+    # -----------------------------------------------------
+    _, _, _, sxx_s, syy_s, szz_s, sxy_s, syz_s, sxz_s = model(X_side_free)
+
+    x_s = X_side_free[:, 0:1]
+    z_s = X_side_free[:, 2:3]
+    r_s = torch.sqrt(x_s**2 + z_s**2 + 1e-30)
+
+    # 对内外圆柱面，法向分别可取 ±(x/r, 0, z/r)
+    # 因为目标是 traction=0，符号不会影响平方损失
+    nx_s = x_s / r_s
+    ny_s = torch.zeros_like(nx_s)
+    nz_s = z_s / r_s
+
+    tx_s, ty_s, tz_s = traction_from_stress(sxx_s, syy_s, szz_s, sxy_s, syz_s, sxz_s, nx_s, ny_s, nz_s)
+
+    loss_side_free = torch.mean((tx_s / SIGMA_REF) ** 2 +
+                                (ty_s / SIGMA_REF) ** 2 +
+                                (tz_s / SIGMA_REF) ** 2)
+
+    # -----------------------------------------------------
+    # 6. 上表面自由边界
+    # y = H_total, outward n=(0,1,0)
+    # traction = [sxy, syy, syz]
+    # -----------------------------------------------------
+    _, _, _, sxx_t, syy_t, szz_t, sxy_t, syz_t, sxz_t = model(X_top_free)
+
+    nx_t = torch.zeros((X_top_free.shape[0], 1), dtype=DTYPE, device=device)
+    ny_t = torch.ones((X_top_free.shape[0], 1), dtype=DTYPE, device=device)
+    nz_t = torch.zeros((X_top_free.shape[0], 1), dtype=DTYPE, device=device)
+
+    tx_t, ty_t, tz_t = traction_from_stress(sxx_t, syy_t, szz_t, sxy_t, syz_t, sxz_t, nx_t, ny_t, nz_t)
+
+    loss_top_free = torch.mean((tx_t / SIGMA_REF) ** 2 +
+                               (ty_t / SIGMA_REF) ** 2 +
+                               (tz_t / SIGMA_REF) ** 2)
+
+    # -----------------------------------------------------
+    # 7. 两个径向侧面自由边界
+    # theta = ±theta_half
+    # 法向可取 e_theta = (-sin theta, 0, cos theta)
+    # traction = 0
+    # -----------------------------------------------------
+    _, _, _, sxx_r, syy_r, szz_r, sxy_r, syz_r, sxz_r = model(X_radial_free)
+
+    x_r = X_radial_free[:, 0:1]
+    z_r = X_radial_free[:, 2:3]
+    theta_r = torch.atan2(z_r, x_r)
+
+    nx_r = -torch.sin(theta_r)
+    ny_r = torch.zeros_like(nx_r)
+    nz_r = torch.cos(theta_r)
+
+    tx_r, ty_r, tz_r = traction_from_stress(sxx_r, syy_r, szz_r, sxy_r, syz_r, sxz_r, nx_r, ny_r, nz_r)
+
+    loss_radial_free = torch.mean((tx_r / SIGMA_REF) ** 2 +
+                                  (ty_r / SIGMA_REF) ** 2 +
+                                  (tz_r / SIGMA_REF) ** 2)
 
     return (
-        x_int,
-        x_edge,
-        x_energy,
-        x_dir,
-        x_dir_edge,
-        x_neu,
-        x_free,
-        n_free,
-        x_free_edge,
-        n_free_edge
+        loss_pde,
+        loss_eq,
+        loss_const,
+        loss_bottom_load,
+        loss_groove_bottom_fixed,
+        loss_groove_side_free,
+        loss_side_free,
+        loss_top_free,
+        loss_radial_free,
+        mean_ty_ratio.detach(),
     )
 
-def evaluate_total_loss_scalar(model, samples):
-    loss_total, _ = compute_losses(model, *samples)
-    return float(loss_total.detach().cpu().item())
-
-def train_model():
-    model = SirenNet(
-        in_features=in_features,
-        hidden_features=hidden_features,
-        hidden_layers=hidden_layers,
-        out_features=out_features,
-        first_omega_0=first_omega_0,
-        hidden_omega_0=hidden_omega_0
-    ).to(device)
-
-    optimizer = torch.optim.Adam(model.parameters(), lr=lr,fused=False)
-    scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
-        optimizer, T_max=epochs, eta_min=eta_min
+def total_weighted_loss_from_losses(losses, base_w, adapt_w):
+    l_pde, _, _, l_load, l_fix, l_gside, l_side, l_top, l_rad, _ = losses
+    return (
+        base_w[0] * adapt_w[0] * l_pde +
+        base_w[1] * adapt_w[1] * l_load +
+        base_w[2] * adapt_w[2] * l_fix +
+        base_w[3] * adapt_w[3] * l_gside +
+        base_w[4] * adapt_w[4] * l_side +
+        base_w[5] * adapt_w[5] * l_top +
+        base_w[6] * adapt_w[6] * l_rad
     )
 
-    history = {
-        "loss_total": [],
-        "loss_pde": [],
-        "loss_pde_edge": [],
-        "loss_energy": [],
-        "loss_const": [],
-        "loss_dir": [],
-        "loss_dir_edge": [],
-        "loss_neu": [],
-        "loss_free": [],
-        "loss_free_edge": []
-    }
+# =========================================================
+# 11. 主程序（整体架构保持不变）
+# =========================================================
+if __name__ == '__main__':
+    model = PINN3D([3, 192, 192, 192, 192, 192, 9]).to(device=device, dtype=DTYPE)
 
-    best_state = None
-    best_loss = float("inf")
+    # 生成数据
+    (
+        X_col,
+        X_bottom_load,
+        X_groove_bottom_fix,
+        X_groove_side_free,
+        X_side_free,
+        X_top_free,
+        X_radial_free
+    ) = get_samples()
 
-    samples = resample_training_points()
+    # 基础权重（保留模板风格）
+    # Order: PDE, bottom load, groove fix, groove side free, inner/outer side
+    # free, top free, radial side free. The latest run showed Top/Rad free
+    # traction losses staying high, so the free-surface weights are raised
+    # while keeping the PDE term explicit through w_eq_pde/w_const_pde.
+    base_w = torch.tensor([1.0, 240.0, 120.0, 20.0, 35.0, 50.0, 40.0], dtype=DTYPE, device=device)
 
-    t0 = time.time()
-    for epoch in range(1, epochs + 1):
-        if (epoch == 1) or (epoch % resample_every == 0):
-            samples = resample_training_points()
+    # Adam 阶段
+    print("Starting Adam training...")
+    print(f"[INFO] Adam epochs = {adam_epochs}, milestones = {adam_milestones}")
+    print(
+        f"[INFO] PDE loss = {w_eq_pde:g} * Eq + "
+        f"Const weight ramp {w_const_pde_start:g}->{w_const_pde_end:g} "
+        f"(epoch {const_ramp_start}->{const_ramp_end})"
+    )
+    print(f"[INFO] bottom load mean penalty weight = {load_mean_weight:g}")
+    print(f"[INFO] adaptive weights enabled = {use_adaptive_weights}")
+    print_sampling_info()
 
-        optimizer.zero_grad(set_to_none=True)
+    optimizer_adam = optim.Adam(
+        model.parameters(),
+        lr=0.001,
+        foreach=False,
+        fused=False,
+        capturable=(device.type == "cuda")
+    )
 
-        loss_total, logs = compute_losses(model, *samples)
-        loss_total.backward()
+    scheduler = MultiStepLR(optimizer_adam, milestones=adam_milestones, gamma=0.5)
+    weighter = AdaptiveWeighter(num_losses=7, alpha=0.9)
 
-        torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=grad_clip)
-        optimizer.step()
-        scheduler.step()
+    t0 = time()
+    for epoch in range(adam_epochs + 1):
+        if epoch > 0 and epoch % resample_every == 0:
+            (
+                X_col,
+                X_bottom_load,
+                X_groove_bottom_fix,
+                X_groove_side_free,
+                X_side_free,
+                X_top_free,
+                X_radial_free
+            ) = get_samples()
 
-        ltot = float(logs["loss_total"].cpu().item())
-        lpde = float(logs["loss_pde"].cpu().item())
-        lpde_edge = float(logs["loss_pde_edge"].cpu().item())
-        lenergy = float(logs["loss_energy"].cpu().item())
-        lconst = float(logs["loss_const"].cpu().item())
-        ldir = float(logs["loss_dir"].cpu().item())
-        ldir_edge = float(logs["loss_dir_edge"].cpu().item())
-        lneu = float(logs["loss_neu"].cpu().item())
-        lfree = float(logs["loss_free"].cpu().item())
-        lfree_edge = float(logs["loss_free_edge"].cpu().item())
+        optimizer_adam.zero_grad()
 
-        history["loss_total"].append(ltot)
-        history["loss_pde"].append(lpde)
-        history["loss_pde_edge"].append(lpde_edge)
-        history["loss_energy"].append(lenergy)
-        history["loss_const"].append(lconst)
-        history["loss_dir"].append(ldir)
-        history["loss_dir_edge"].append(ldir_edge)
-        history["loss_neu"].append(lneu)
-        history["loss_free"].append(lfree)
-        history["loss_free_edge"].append(lfree_edge)
-
-        if ltot < best_loss:
-            best_loss = ltot
-            best_state = copy.deepcopy(model.state_dict())
-
-        if epoch % print_every == 0 or epoch == 1:
-            current_lr = optimizer.param_groups[0]["lr"]
-            elapsed = time.time() - t0
-            print(
-                f"Epoch [{epoch:6d}/{epochs}] | "
-                f"Total={ltot:.6e} | PDE={lpde:.6e} | PDEe={lpde_edge:.6e} | "
-                f"ENE={lenergy:.6e} | CONST={lconst:.6e} | "
-                f"DIR={ldir:.6e} | DIRe={ldir_edge:.6e} | "
-                f"NEU={lneu:.6e} | FREE={lfree:.6e} | FREEe={lfree_edge:.6e} | "
-                f"lr={current_lr:.3e} | time={elapsed:.1f}s"
-            )
-
-    if best_state is not None:
-        model.load_state_dict(best_state)
-
-    lbfgs_val_before = None
-    lbfgs_val_after = None
-    lbfgs_kept = False
-
-    if use_lbfgs_finetune:
-        print("\n[LBFGS] 开始固定样本精修...")
-
-        pre_lbfgs_state = copy.deepcopy(model.state_dict())
-        val_samples = resample_training_points()
-        lbfgs_samples = resample_training_points()
-
-        lbfgs_val_before = evaluate_total_loss_scalar(model, val_samples)
-        print(f"[LBFGS] 精修前验证总损失 = {lbfgs_val_before:.6e}")
-
-        optimizer_lbfgs = torch.optim.LBFGS(
-            model.parameters(),
-            lr=lbfgs_lr,
-            max_iter=lbfgs_max_iter,
-            history_size=lbfgs_history_size,
-            line_search_fn="strong_wolfe"
+        const_weight = get_const_weight(epoch)
+        l_pde, l_eq, l_const, l_load, l_fix, l_gside, l_side, l_top, l_rad, mean_ty_ratio = compute_losses(
+            model,
+            X_col,
+            X_bottom_load,
+            X_groove_bottom_fix,
+            X_groove_side_free,
+            X_side_free,
+            X_top_free,
+            X_radial_free,
+            const_weight=const_weight
         )
+        loss_list = [l_pde, l_load, l_fix, l_gside, l_side, l_top, l_rad]
 
-        lbfgs_iter = [0]
-
-        def closure():
-            optimizer_lbfgs.zero_grad()
-
-            loss_total_lbfgs, logs_lbfgs = compute_losses(model, *lbfgs_samples)
-            loss_total_lbfgs.backward()
-
-            lbfgs_iter[0] += 1
-            if lbfgs_iter[0] == 1 or lbfgs_iter[0] % lbfgs_print_every == 0:
+        if use_adaptive_weights and epoch % 100 == 0 and epoch > 0:
+            weighter.update(model, loss_list)
+            if epoch % 500 == 0:
+                w = weighter.weights.detach().cpu().numpy()
                 print(
-                    f"[LBFGS] Iter={lbfgs_iter[0]:4d} | "
-                    f"Total={float(loss_total_lbfgs.detach().cpu().item()):.6e} | "
-                    f"PDE={float(logs_lbfgs['loss_pde'].cpu().item()):.6e} | "
-                    f"PDEe={float(logs_lbfgs['loss_pde_edge'].cpu().item()):.6e} | "
-                    f"ENE={float(logs_lbfgs['loss_energy'].cpu().item()):.6e} | "
-                    f"CONST={float(logs_lbfgs['loss_const'].cpu().item()):.6e} | "
-                    f"DIR={float(logs_lbfgs['loss_dir'].cpu().item()):.6e} | "
-                    f"DIRe={float(logs_lbfgs['loss_dir_edge'].cpu().item()):.6e} | "
-                    f"NEU={float(logs_lbfgs['loss_neu'].cpu().item()):.6e} | "
-                    f"FREE={float(logs_lbfgs['loss_free'].cpu().item()):.6e} | "
-                    f"FREEe={float(logs_lbfgs['loss_free_edge'].cpu().item()):.6e}"
+                    f"Ep {epoch} | "
+                    f"PDE:{w[0]:.2f} | Load:{w[1]:.2f} | Fix:{w[2]:.2f} | "
+                    f"GrooveSide:{w[3]:.2f} | Side:{w[4]:.2f} | Top:{w[5]:.2f} | Rad:{w[6]:.2f}"
                 )
 
-            return loss_total_lbfgs
-
-        optimizer_lbfgs.step(closure)
-
-        lbfgs_val_after = evaluate_total_loss_scalar(model, val_samples)
-        print(f"[LBFGS] 精修后验证总损失 = {lbfgs_val_after:.6e}")
-
-        if lbfgs_val_after <= lbfgs_val_before:
-            lbfgs_kept = True
-            print("[LBFGS] 验证总损失改善，保留精修后的权重。")
-        else:
-            model.load_state_dict(pre_lbfgs_state)
-            print("[LBFGS] 验证总损失未改善，回退到 Adam 最优权重。")
-
-    model_save_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), model_save_name)
-    torch.save(model.state_dict(), model_save_path)
-
-    print(f"[训练结束] Adam阶段最优总损失 = {best_loss:.6e}")
-    if use_lbfgs_finetune and lbfgs_val_before is not None and lbfgs_val_after is not None:
-        print(
-            f"[训练结束] LBFGS验证总损失: "
-            f"{lbfgs_val_before:.6e} -> {lbfgs_val_after:.6e} "
-            f"({'保留' if lbfgs_kept else '回退'})"
+        adapt_w = weighter.weights if use_adaptive_weights else torch.ones_like(weighter.weights)
+        loss = (
+            base_w[0] * adapt_w[0] * l_pde +
+            base_w[1] * adapt_w[1] * l_load +
+            base_w[2] * adapt_w[2] * l_fix +
+            base_w[3] * adapt_w[3] * l_gside +
+            base_w[4] * adapt_w[4] * l_side +
+            base_w[5] * adapt_w[5] * l_top +
+            base_w[6] * adapt_w[6] * l_rad
         )
-    print(f"[模型保存] 最优模型权重已保存至: {model_save_path}")
-    return model, history
 
-# ============================================================
-# 7. 后处理与可视化模块
-# ============================================================
+        if epoch % 50 == 0:
+            elapsed = time() - t0
+            weighted_pde = base_w[0] * adapt_w[0] * l_pde
+            weighted_bc = (
+                base_w[1] * adapt_w[1] * l_load +
+                base_w[2] * adapt_w[2] * l_fix +
+                base_w[3] * adapt_w[3] * l_gside +
+                base_w[4] * adapt_w[4] * l_side +
+                base_w[5] * adapt_w[5] * l_top +
+                base_w[6] * adapt_w[6] * l_rad
+            )
+            print(
+                f"Ep {epoch:5d} | Total:{loss.item():.4e} | PDE:{l_pde.item():.4e} | "
+                f"Eq:{l_eq.item():.4e} | Const:{l_const.item():.4e} | "
+                f"WConst:{const_weight:.3g} | "
+                f"Load:{l_load.item():.4e} | Fix:{l_fix.item():.4e} | "
+                f"GrooveSide:{l_gside.item():.4e} | Side:{l_side.item():.4e} | "
+                f"Top:{l_top.item():.4e} | Rad:{l_rad.item():.4e} | "
+                f"W_PDE:{weighted_pde.item():.4e} | W_BC:{weighted_bc.item():.4e} | "
+                f"mean_ty/q:{mean_ty_ratio.item():.4e} | "
+                f"time:{elapsed:.1f}s"
+            )
 
-def evaluate_points_with_stress(model, points_np, batch_size=4096):
-    """
-    对任意点集评估：
-    - 位移 u,v,w
-    - 位移模长 |u|
-    - von Mises 应力
-    """
-    model.eval()
+        loss.backward()
+        optimizer_adam.step()
+        scheduler.step()
 
-    all_disp = []
-    all_vm = []
-    all_sigma = []
-
-    n_total = points_np.shape[0]
-    for i in range(0, n_total, batch_size):
-        pts_batch_np = points_np[i:i + batch_size]
-        pts = torch.tensor(pts_batch_np, dtype=dtype, device=device, requires_grad=True)
-
-        out = kinematics_and_stress(pts, model, create_graph=False)
-        u = torch.cat([out["u"], out["v"], out["w"]], dim=1)
-        vm = von_mises_from_stress(out["sxx"], out["syy"], out["szz"],
-                                   out["sxy"], out["syz"], out["sxz"])
-        sigma = torch.cat([out["sxx"], out["syy"], out["szz"],
-                           out["sxy"], out["syz"], out["sxz"]], dim=1)
-
-        all_disp.append(u.detach().cpu().numpy())
-        all_vm.append(vm.detach().cpu().numpy())
-        all_sigma.append(sigma.detach().cpu().numpy())
-
-    disp = np.vstack(all_disp)
-    vm = np.vstack(all_vm)
-    sigma = np.vstack(all_sigma)
-    umag = np.linalg.norm(disp, axis=1, keepdims=True)
-    return disp, umag, vm, sigma
-
-def summarize_extrema_for_points(model, region_name, points_np, batch_size=4096):
-    """
-    对给定点集统计该区域内的最大位移与最大 von Mises 应力。
-    """
-    disp, umag, vm, sigma = evaluate_points_with_stress(model, points_np, batch_size=batch_size)
-
-    idx_u = int(np.argmax(umag[:, 0]))
-    idx_vm = int(np.argmax(vm[:, 0]))
-
-    return {
-        "region": region_name,
-        "num_points": int(points_np.shape[0]),
-        "u_max": float(umag[idx_u, 0]),
-        "u_point": points_np[idx_u].copy(),
-        "vm_max": float(vm[idx_vm, 0]),
-        "vm_point": points_np[idx_vm].copy()
-    }
-
-def estimate_global_extrema(model, n_eval=50000):
-    """
-    通过“内部 + 各类边界 + 凹槽底缘邻域”的分区域采样，
-    更公平地近似评估全域最大位移和最大 von Mises 应力。
-    """
-    n_surface_eval = max(8000, n_eval // 6)
-    n_edge_eval = max(12000, n_eval // 4)
-
-    x_free_eval, _ = sample_free_surface_boundary(n_surface_eval)
-
-    region_specs = [
-        ("内部随机采样", sample_interior(n_eval)),
-        ("底面受力边界", sample_sector_annulus(n_surface_eval, y_value=0.0)),
-        ("凹槽底面固支边界", sample_groove_bottom(n_surface_eval)),
-        ("其余自由表面", x_free_eval),
-        ("凹槽底缘邻域内部", sample_interior_groove_edge_neighborhood(n_edge_eval)),
-        ("凹槽底面近边缘", sample_groove_bottom_edge_band(n_surface_eval)),
-        ("凹槽侧壁近底缘", sample_groove_side_edge_band(n_surface_eval))
-    ]
-
-    summaries = [
-        summarize_extrema_for_points(model, region_name, pts, batch_size=4096)
-        for region_name, pts in region_specs
-    ]
-
-    best_u = max(summaries, key=lambda item: item["u_max"])
-    best_vm = max(summaries, key=lambda item: item["vm_max"])
-
-    print("\n================= 关键工程结果（分区域高密度采样近似） =================")
-    print(f"[位移] 全局近似最大值来自：{best_u['region']}")
-    print(f"最大位移模长 |u|max ≈ {best_u['u_max']:.6e} m")
-    print(
-        f"对应坐标 ≈ ({best_u['u_point'][0]:.6f}, "
-        f"{best_u['u_point'][1]:.6f}, {best_u['u_point'][2]:.6f}) m"
+    # L-BFGS 阶段
+    adam_state = copy.deepcopy(model.state_dict())
+    validation_samples = get_validation_samples()
+    lbfgs_const_weight = w_const_pde_end
+    val_losses_before = compute_losses(
+        model,
+        *validation_samples,
+        const_weight=lbfgs_const_weight
     )
-    print(f"[应力] 全局近似最大值来自：{best_vm['region']}")
-    print(f"最大 von Mises 应力 σ_vm,max ≈ {best_vm['vm_max']:.6e} Pa")
-    print(
-        f"对应坐标 ≈ ({best_vm['vm_point'][0]:.6f}, "
-        f"{best_vm['vm_point'][1]:.6f}, {best_vm['vm_point'][2]:.6f}) m"
+    val_loss_before = total_weighted_loss_from_losses(val_losses_before, base_w, adapt_w).detach()
+
+    print("\nStarting L-BFGS...")
+    print(f"[L-BFGS] validation loss before = {val_loss_before.item():.4e}")
+    final_w = weighter.weights.detach() if use_adaptive_weights else torch.ones_like(weighter.weights)
+
+    optimizer_lbfgs = torch.optim.LBFGS(
+        model.parameters(),
+        lr=0.5,
+        max_iter=2000,
+        line_search_fn="strong_wolfe"
     )
-    print("---------------- 各区域峰值概览 ----------------")
-    for item in summaries:
-        print(
-            f"{item['region']:<18} | 点数={item['num_points']:6d} | "
-            f"|u|max={item['u_max']:.6e} m | "
-            f"σ_vm,max={item['vm_max']:.6e} Pa"
+
+    iter_count = [0]
+
+    def closure():
+        optimizer_lbfgs.zero_grad()
+
+        l_pde, _, _, l_load, l_fix, l_gside, l_side, l_top, l_rad, _ = compute_losses(
+            model,
+            X_col,
+            X_bottom_load,
+            X_groove_bottom_fix,
+            X_groove_side_free,
+            X_side_free,
+            X_top_free,
+            X_radial_free,
+            const_weight=lbfgs_const_weight
         )
-    print("=======================================================================\n")
-    return summaries
 
-def make_mask_xy_section(X, Y, z_const=0.0):
-    """
-    中心剖面 z=z_const 的实体域掩膜。
-    """
-    Z = np.full_like(X, fill_value=z_const)
-    return in_solid_np(X, Y, Z)
+        loss = (
+            base_w[0] * final_w[0] * l_pde +
+            base_w[1] * final_w[1] * l_load +
+            base_w[2] * final_w[2] * l_fix +
+            base_w[3] * final_w[3] * l_gside +
+            base_w[4] * final_w[4] * l_side +
+            base_w[5] * final_w[5] * l_top +
+            base_w[6] * final_w[6] * l_rad
+        )
 
-def make_mask_xz_slice(X, Z, y_const):
-    """
-    水平切片 y=y_const 的实体域掩膜。
-    """
-    Y = np.full_like(X, fill_value=y_const)
-    return in_solid_np(X, Y, Z)
+        loss.backward()
+        iter_count[0] += 1
 
-def plot_training_history(history):
-    plt.figure(figsize=(10, 6))
-    plt.semilogy(history["loss_total"], label="Total loss")
-    plt.semilogy(history["loss_pde"], label="PDE loss")
-    plt.semilogy(history["loss_pde_edge"], label="Edge PDE loss")
-    plt.semilogy(history["loss_energy"], label="Energy loss")
-    plt.semilogy(history["loss_const"], label="Constitutive loss")
-    plt.semilogy(history["loss_dir"], label="Dirichlet loss")
-    plt.semilogy(history["loss_dir_edge"], label="Edge Dirichlet loss")
-    plt.semilogy(history["loss_neu"], label="Neumann loss")
-    plt.semilogy(history["loss_free"], label="Free surface loss")
-    plt.semilogy(history["loss_free_edge"], label="Edge free surface loss")
-    plt.xlabel("Epoch")
-    plt.ylabel("Loss (log scale)")
-    plt.title("PINN Training Loss History")
-    plt.legend()
-    plt.tight_layout()
-    plt.show()
+        if iter_count[0] % 20 == 0:
+            print(f"L-BFGS Iter: {iter_count[0]} | Loss: {loss.item():.4e}")
 
-def plot_center_section(model, nx=250, ny=180):
-    """
-    绘制中心剖面 z=0 上的：
-    1) 位移模长云图
-    2) von Mises 应力云图
-    """
-    x_min, x_max = -0.02, R_outer + 0.02
-    y_min, y_max = 0.0, H_total
+        return loss
 
-    x = np.linspace(x_min, x_max, nx)
-    y = np.linspace(y_min, y_max, ny)
-    X, Y = np.meshgrid(x, y)
-    Z = np.zeros_like(X)
+    optimizer_lbfgs.step(closure)
 
-    mask = make_mask_xy_section(X, Y, z_const=0.0)
-    pts = np.stack([X[mask], Y[mask], Z[mask]], axis=1)
+    val_losses_after = compute_losses(
+        model,
+        *validation_samples,
+        const_weight=lbfgs_const_weight
+    )
+    val_loss_after = total_weighted_loss_from_losses(val_losses_after, base_w, final_w).detach()
+    print(f"[L-BFGS] validation loss after  = {val_loss_after.item():.4e}")
 
-    disp, umag, vm, sigma = evaluate_points_with_stress(model, pts, batch_size=4096)
+    if val_loss_after > 1.05 * val_loss_before:
+        model.load_state_dict(adam_state)
+        print("[L-BFGS] validation got worse; restored Adam-final weights.")
+    else:
+        print("[L-BFGS] validation improved or stayed stable; kept L-BFGS weights.")
 
-    U_plot = np.full_like(X, np.nan, dtype=np.float64)
-    VM_plot = np.full_like(X, np.nan, dtype=np.float64)
-    U_plot[mask] = umag[:, 0]
-    VM_plot[mask] = vm[:, 0]
+    print("Training Finished.")
 
-    fig, axes = plt.subplots(1, 2, figsize=(14, 5))
-
-    cf1 = axes[0].contourf(X, Y, U_plot, levels=60)
-    axes[0].set_title(r"Center section $z=0$: displacement magnitude $|\mathbf{u}|$ (m)")
-    axes[0].set_xlabel("x (m)")
-    axes[0].set_ylabel("y (m)")
-    axes[0].set_aspect("equal")
-    plt.colorbar(cf1, ax=axes[0])
-
-    cf2 = axes[1].contourf(X, Y, VM_plot, levels=60)
-    axes[1].set_title(r"Center section $z=0$: von Mises stress (Pa)")
-    axes[1].set_xlabel("x (m)")
-    axes[1].set_ylabel("y (m)")
-    axes[1].set_aspect("equal")
-    plt.colorbar(cf2, ax=axes[1])
-
-    plt.tight_layout()
-    plt.show()
-
-def plot_horizontal_slice(model, y_const=0.035, nx=260, nz=240):
-    """
-    绘制水平切片 y=y_const 的：
-    1) 位移模长云图
-    2) von Mises 应力云图
-    """
-    x_min = R_inner * np.cos(theta_max) - 0.03
-    x_max = R_outer + 0.02
-    z_lim = R_outer * np.sin(theta_max) + 0.03
-
-    x = np.linspace(x_min, x_max, nx)
-    z = np.linspace(-z_lim, z_lim, nz)
-    X, Z = np.meshgrid(x, z)
-    Y = np.full_like(X, fill_value=y_const)
-
-    mask = make_mask_xz_slice(X, Z, y_const=y_const)
-    pts = np.stack([X[mask], Y[mask], Z[mask]], axis=1)
-
-    disp, umag, vm, sigma = evaluate_points_with_stress(model, pts, batch_size=4096)
-
-    U_plot = np.full_like(X, np.nan, dtype=np.float64)
-    VM_plot = np.full_like(X, np.nan, dtype=np.float64)
-    U_plot[mask] = umag[:, 0]
-    VM_plot[mask] = vm[:, 0]
-
-    fig, axes = plt.subplots(1, 2, figsize=(14, 5))
-
-    cf1 = axes[0].contourf(X, Z, U_plot, levels=60)
-    axes[0].set_title(rf"Horizontal slice $y={y_const:.3f}$ m: $|\mathbf{{u}}|$ (m)")
-    axes[0].set_xlabel("x (m)")
-    axes[0].set_ylabel("z (m)")
-    axes[0].set_aspect("equal")
-    plt.colorbar(cf1, ax=axes[0])
-
-    cf2 = axes[1].contourf(X, Z, VM_plot, levels=60)
-    axes[1].set_title(rf"Horizontal slice $y={y_const:.3f}$ m: von Mises stress (Pa)")
-    axes[1].set_xlabel("x (m)")
-    axes[1].set_ylabel("z (m)")
-    axes[1].set_aspect("equal")
-    plt.colorbar(cf2, ax=axes[1])
-
-    plt.tight_layout()
-    plt.show()
-
-# ============================================================
-# 主程序入口
-# ============================================================
-
-if __name__ == "__main__":
-    print(f"[设备] {device}")
-    print(f"[参考尺度] L_ref={L_ref:.3e} m, T_ref={T_ref:.3e} Pa, U_ref={U_ref:.3e} m")
-    print("[说明] 本代码使用的边界：凹槽底面固支 + 底面向上受力 + 凹槽侧壁及其余外表面零牵引自由边界。")
-
-    model, history = train_model()
-
-    # 训练历史
-    plot_training_history(history)
-
-    # 输出关键工程指标（通过高密度随机采样近似）
-    estimate_global_extrema(model, n_eval=50000)
-
-    # 可视化：中心剖面 z=0
-    plot_center_section(model, nx=260, ny=180)
-
-    # 可视化：中部水平截面 y=0.035
-    plot_horizontal_slice(model, y_const=0.035, nx=260, nz=240)
-
-    # 可视化：凹槽深度范围内的水平截面 y=0.060
-    plot_horizontal_slice(model, y_const=0.060, nx=260, nz=240)
+    save_path = "pinn_sector_groove_model.pth"
+    torch.save(model.state_dict(), save_path)
+    print(f"模型权重已成功保存至: {save_path}")

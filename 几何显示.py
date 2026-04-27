@@ -14,7 +14,8 @@ from 扇形2 import (
     theta_min, theta_max,
     x_groove, R_groove,
     y_groove_bottom, y_groove_top,
-    E_val, q_load, U_REF, SIGMA_REF
+    E_val, q_load, U_REF, SIGMA_REF,
+    lmda, mu
 )
 
 # =========================================================
@@ -22,7 +23,7 @@ from 扇形2 import (
 # =========================================================
 model = PINN3D([3,192, 192, 192, 192, 192, 9]).to(device=device, dtype=DTYPE)
 
-model_path = "pinn_sector_groove_model (7).pth"
+model_path = "pinn_sector_groove_model (14).pth"
 if os.path.exists(model_path):
     model.load_state_dict(torch.load(model_path, map_location=device))
     print("成功加载模型权重！")
@@ -46,50 +47,102 @@ model.eval()
 # 位移分量：
 #   u, v, w 分别对应 x, y, z 方向
 # =========================================================
-def predict_on_points(model, pts, stress_scale=1.0, disp_scale=1.0, batch_size=20000):
+def von_mises_np(sxx, syy, szz, sxy, syz, sxz):
+    return np.sqrt(
+        0.5 * (
+            (sxx - syy) ** 2 +
+            (syy - szz) ** 2 +
+            (szz - sxx) ** 2 +
+            6.0 * (sxy**2 + syz**2 + sxz**2)
+        )
+    )
+
+
+def get_gradients(u, x):
+    return torch.autograd.grad(
+        u,
+        x,
+        torch.ones_like(u),
+        create_graph=False,
+        retain_graph=True,
+    )[0]
+
+
+def predict_on_points(model, pts, stress_scale=1.0, disp_scale=1.0, batch_size=4096):
     pts_tensor = torch.tensor(pts, dtype=DTYPE, device=device)
 
     u_list, v_list, w_list = [], [], []
-    utotal_list, vm_list = [], []
+    utotal_list = []
+    vm_net_list, vm_disp_list = [], []
+    vm_abs_diff_list, vm_rel_diff_list = [], []
 
-    with torch.no_grad():
+    with torch.enable_grad():
         for i in range(0, len(pts), batch_size):
-            batch = pts_tensor[i:i + batch_size]
+            batch = pts_tensor[i:i + batch_size].detach().clone().requires_grad_(True)
             u, v, w, sxx, syy, szz, sxy, syz, sxz = model(batch)
 
-            u = u.cpu().numpy().reshape(-1) * disp_scale
-            v = v.cpu().numpy().reshape(-1) * disp_scale
-            w = w.cpu().numpy().reshape(-1) * disp_scale
+            gu = get_gradients(u, batch)
+            gv = get_gradients(v, batch)
+            gw = get_gradients(w, batch)
 
-            sxx = sxx.cpu().numpy().reshape(-1) * stress_scale
-            syy = syy.cpu().numpy().reshape(-1) * stress_scale
-            szz = szz.cpu().numpy().reshape(-1) * stress_scale
-            sxy = sxy.cpu().numpy().reshape(-1) * stress_scale
-            syz = syz.cpu().numpy().reshape(-1) * stress_scale
-            sxz = sxz.cpu().numpy().reshape(-1) * stress_scale
+            ux, uy, uz = gu[:, 0:1], gu[:, 1:2], gu[:, 2:3]
+            vx, vy, vz = gv[:, 0:1], gv[:, 1:2], gv[:, 2:3]
+            wx, wy, wz = gw[:, 0:1], gw[:, 1:2], gw[:, 2:3]
+            div_u = ux + vy + wz
 
-            utotal = np.sqrt(u**2 + v**2 + w**2)
-            vm = np.sqrt(
-                0.5 * (
-                    (sxx - syy) ** 2 +
-                    (syy - szz) ** 2 +
-                    (szz - sxx) ** 2 +
-                    6.0 * (sxy**2 + syz**2 + sxz**2)
-                )
+            sxx_disp = lmda * div_u + 2.0 * mu * ux
+            syy_disp = lmda * div_u + 2.0 * mu * vy
+            szz_disp = lmda * div_u + 2.0 * mu * wz
+            sxy_disp = mu * (uy + vx)
+            syz_disp = mu * (vz + wy)
+            sxz_disp = mu * (uz + wx)
+
+            u_np = u.detach().cpu().numpy().reshape(-1) * disp_scale
+            v_np = v.detach().cpu().numpy().reshape(-1) * disp_scale
+            w_np = w.detach().cpu().numpy().reshape(-1) * disp_scale
+
+            sxx_np = sxx.detach().cpu().numpy().reshape(-1) * stress_scale
+            syy_np = syy.detach().cpu().numpy().reshape(-1) * stress_scale
+            szz_np = szz.detach().cpu().numpy().reshape(-1) * stress_scale
+            sxy_np = sxy.detach().cpu().numpy().reshape(-1) * stress_scale
+            syz_np = syz.detach().cpu().numpy().reshape(-1) * stress_scale
+            sxz_np = sxz.detach().cpu().numpy().reshape(-1) * stress_scale
+
+            sxx_disp_np = sxx_disp.detach().cpu().numpy().reshape(-1) * stress_scale
+            syy_disp_np = syy_disp.detach().cpu().numpy().reshape(-1) * stress_scale
+            szz_disp_np = szz_disp.detach().cpu().numpy().reshape(-1) * stress_scale
+            sxy_disp_np = sxy_disp.detach().cpu().numpy().reshape(-1) * stress_scale
+            syz_disp_np = syz_disp.detach().cpu().numpy().reshape(-1) * stress_scale
+            sxz_disp_np = sxz_disp.detach().cpu().numpy().reshape(-1) * stress_scale
+
+            utotal = np.sqrt(u_np**2 + v_np**2 + w_np**2)
+            vm_net = von_mises_np(sxx_np, syy_np, szz_np, sxy_np, syz_np, sxz_np)
+            vm_disp = von_mises_np(
+                sxx_disp_np, syy_disp_np, szz_disp_np,
+                sxy_disp_np, syz_disp_np, sxz_disp_np
             )
+            vm_abs_diff = np.abs(vm_net - vm_disp)
+            vm_rel_diff = vm_abs_diff / np.maximum(np.maximum(np.abs(vm_net), np.abs(vm_disp)), 1.0)
 
-            u_list.append(u)
-            v_list.append(v)
-            w_list.append(w)
+            u_list.append(u_np)
+            v_list.append(v_np)
+            w_list.append(w_np)
             utotal_list.append(utotal)
-            vm_list.append(vm)
+            vm_net_list.append(vm_net)
+            vm_disp_list.append(vm_disp)
+            vm_abs_diff_list.append(vm_abs_diff)
+            vm_rel_diff_list.append(vm_rel_diff)
 
     return {
         "u": np.concatenate(u_list),
         "v": np.concatenate(v_list),
         "w": np.concatenate(w_list),
         "utotal": np.concatenate(utotal_list),
-        "vm": np.concatenate(vm_list),
+        "vm": np.concatenate(vm_net_list),
+        "vm_net": np.concatenate(vm_net_list),
+        "vm_disp": np.concatenate(vm_disp_list),
+        "vm_abs_diff": np.concatenate(vm_abs_diff_list),
+        "vm_rel_diff": np.concatenate(vm_rel_diff_list),
     }
 
 
@@ -251,6 +304,10 @@ def make_structured_surface(xx, yy, zz, field_dict, deformation_vis_scale=0.0):
 
     utotal = field_dict["utotal"].reshape(xx.shape)
     vm = field_dict["vm"].reshape(xx.shape)
+    vm_net = field_dict["vm_net"].reshape(xx.shape)
+    vm_disp = field_dict["vm_disp"].reshape(xx.shape)
+    vm_abs_diff = field_dict["vm_abs_diff"].reshape(xx.shape)
+    vm_rel_diff = field_dict["vm_rel_diff"].reshape(xx.shape)
 
     # 注意：这里位移分量对应 x/y/z
     x_plot = xx + deformation_vis_scale * u
@@ -264,6 +321,10 @@ def make_structured_surface(xx, yy, zz, field_dict, deformation_vis_scale=0.0):
     grid["w"] = w.ravel(order="F")
     grid["utotal"] = utotal.ravel(order="F")
     grid["vm"] = vm.ravel(order="F")
+    grid["vm_net"] = vm_net.ravel(order="F")
+    grid["vm_disp"] = vm_disp.ravel(order="F")
+    grid["vm_abs_diff"] = vm_abs_diff.ravel(order="F")
+    grid["vm_rel_diff"] = vm_rel_diff.ravel(order="F")
 
     surf = grid.extract_surface().triangulate().clean(tolerance=1e-10)
 
@@ -295,6 +356,10 @@ def make_masked_quad_surface(xx, yy, zz, valid_mask, field_dict, deformation_vis
     w = field_dict["w"].reshape(xx.shape)
     utotal = field_dict["utotal"].reshape(xx.shape)
     vm = field_dict["vm"].reshape(xx.shape)
+    vm_net = field_dict["vm_net"].reshape(xx.shape)
+    vm_disp = field_dict["vm_disp"].reshape(xx.shape)
+    vm_abs_diff = field_dict["vm_abs_diff"].reshape(xx.shape)
+    vm_rel_diff = field_dict["vm_rel_diff"].reshape(xx.shape)
 
     x_plot = xx + deformation_vis_scale * u
     y_plot = yy + deformation_vis_scale * v
@@ -333,6 +398,10 @@ def make_masked_quad_surface(xx, yy, zz, valid_mask, field_dict, deformation_vis
     surf["w"] = w.ravel(order="F")
     surf["utotal"] = utotal.ravel(order="F")
     surf["vm"] = vm.ravel(order="F")
+    surf["vm_net"] = vm_net.ravel(order="F")
+    surf["vm_disp"] = vm_disp.ravel(order="F")
+    surf["vm_abs_diff"] = vm_abs_diff.ravel(order="F")
+    surf["vm_rel_diff"] = vm_rel_diff.ravel(order="F")
 
     surf = surf.triangulate().clean(tolerance=1e-10)
     surf = surf.compute_normals(
@@ -442,6 +511,23 @@ def merge_sector_surfaces(mesh_dict):
     return merged
 
 
+def print_vm_consistency_report(mesh_dict):
+    print("\n================ VM consistency report ================")
+    for name, mesh in mesh_dict.items():
+        vm_net = np.asarray(mesh["vm_net"])
+        vm_disp = np.asarray(mesh["vm_disp"])
+        rel = np.asarray(mesh["vm_rel_diff"])
+        net_i = int(np.argmax(vm_net))
+        disp_i = int(np.argmax(vm_disp))
+        print(
+            f"{name:14s} | "
+            f"max(vm_net)={vm_net[net_i]:.6e} Pa | "
+            f"max(vm_disp)={vm_disp[disp_i]:.6e} Pa | "
+            f"mean(rel_diff)={np.mean(rel):.3e} | "
+            f"p95(rel_diff)={np.percentile(rel, 95):.3e}"
+        )
+
+
 # =========================================================
 # 9. 公共绘图场景
 # =========================================================
@@ -466,9 +552,10 @@ def _add_common_scene(
         clim=clim,
         show_edges=show_edges,
         smooth_shading=smooth_shading,
-        specular=0.1,
-        diffuse=1.0,
-        ambient=0.2,
+        lighting=False,
+        specular=0.0,
+        diffuse=0.0,
+        ambient=1.0,
         scalar_bar_args={
             "title": field_name,
             "vertical": True,
@@ -501,7 +588,7 @@ def plot_sector_field_pyvista(
     cmap="jet",
     clim=None,
     show_edges=False,
-    smooth_shading=True,
+    smooth_shading=False,
     parallel_projection=True,
     background="white",
     screenshot=None,
@@ -608,6 +695,8 @@ def plot_sector_disp_and_vm_pyvista(
         n_groove_r=n_groove_r,
     )
 
+    print_vm_consistency_report(mesh_dict)
+
     plot_sector_field_pyvista(
         mesh_dict=mesh_dict,
         field_name="utotal",
@@ -619,10 +708,28 @@ def plot_sector_disp_and_vm_pyvista(
     plot_sector_field_pyvista(
         mesh_dict=mesh_dict,
         field_name="vm",
-        title="Von Mises Stress (Sector + Groove, PyVista)",
+        title="Von Mises Stress from Network Stress Head",
         screenshot="sector_von_mises_pyvista.png",
         show_window=True
     )
+
+    plot_sector_field_pyvista(
+        mesh_dict=mesh_dict,
+        field_name="vm_disp",
+        title="Von Mises Stress from Displacement Gradients",
+        screenshot="sector_von_mises_from_disp_pyvista.png",
+        show_window=True
+    )
+
+    plot_sector_field_pyvista(
+        mesh_dict=mesh_dict,
+        field_name="vm_rel_diff",
+        title="Relative Difference: Network VM vs Displacement-Gradient VM",
+        cmap="viridis",
+        screenshot="sector_von_mises_relative_difference.png",
+        show_window=True
+    )
+
     mesh_bottom = mesh_dict["bottom"]
 
     plot_sector_field_pyvista(

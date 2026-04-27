@@ -1,9 +1,3 @@
-import os
-
-# Keep CUDA allocation a bit friendlier on small GPUs. This must be set before
-# importing torch to have an effect.
-os.environ.setdefault("PYTORCH_CUDA_ALLOC_CONF", "max_split_size_mb:128")
-
 import torch
 import torch.nn as nn
 import torch.optim as optim
@@ -11,6 +5,7 @@ import numpy as np
 from pyDOE2 import lhs
 from torch.optim.lr_scheduler import MultiStepLR
 import matplotlib.pyplot as plt
+import os
 import copy
 from time import time
 
@@ -20,10 +15,8 @@ from time import time
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 os.environ["KMP_DUPLICATE_LIB_OK"] = "TRUE"
 
-# 6GB 显存跑 displacement-only 二阶导数时，float64 + 大采样量很容易 OOM。
-# 如果你在 16GB/24GB 以上显卡上训练，可改为 True 提高数值精度。
-USE_FLOAT64 = False
-DTYPE = torch.float64 if USE_FLOAT64 else torch.float32
+# 建议使用 float64，适合固体力学 PINN
+DTYPE = torch.float64
 torch.set_default_dtype(DTYPE)
 
 # 关闭 TF32，避免双精度/高阶导数时出现额外数值扰动
@@ -81,11 +74,12 @@ print(f"[INFO] q_load      = {q_load:.6e} Pa")
 # =========================================================
 # 4. 训练时的参考尺度（只用于损失归一化，不改变物理模型）
 # =========================================================
-L_ref = H_total
+L_ref = R_outer - R_inner
 SIGMA_REF = q_load
-U_REF = q_load * H_total / E_val          # 约 6.5e-5 m
+U_REF = q_load * L_ref / E_val
 PDE_REF = SIGMA_REF / L_ref               # div(sigma) 的量纲尺度
 
+print(f"[INFO] L_ref       = {L_ref:.6e} m (radial thickness)")
 print(f"[INFO] U_REF       = {U_REF:.6e} m")
 print(f"[INFO] SIGMA_REF   = {SIGMA_REF:.6e} Pa")
 print(f"[INFO] PDE_REF     = {PDE_REF:.6e} Pa/m")
@@ -97,28 +91,39 @@ resample_every = 50
 adam_epochs = 2000
 adam_milestones = [800, 1400, 1800]
 
-# 6GB GPU preset for the displacement-only formulation. The PDE residual uses
-# second derivatives, so memory grows much faster than the mixed stress-output
-# version.
-hidden_features = 128
-N_col_uniform_train = 5000
-N_col_edge_train = 1200
-N_boundary_train = 1000
-N_col_uniform_val = 2000
-N_col_edge_val = 500
-N_boundary_val = 400
-lbfgs_max_iter = 500
-lbfgs_history_size = 20
-
 # The boundary terms converge quickly in this case. Keeping the adaptive
 # GradNorm-style weights on tends to keep amplifying already-small boundary
 # losses, so the default run uses fixed, PDE-focused weights.
 use_adaptive_weights = False
 
 # PDE = equilibrium + constitutive consistency. The raw Eq term is the main
-# bottleneck in the current logs, so make it explicit and stronger.
+# bottleneck in the current logs, so keep it explicit. The constitutive term
+# should not be too large from epoch 0, otherwise it can flatten the
+# displacement gradients before the thickness response is learned.
 w_eq_pde = 10.0
-w_const_pde = 2.0
+w_const_pde_start = 2.0
+w_const_pde_end = 4.0
+const_ramp_start = 600
+const_ramp_end = 1600
+
+# The bottom load is a resultant-force condition in practice. A pointwise
+# traction MSE can look modest even when the mean traction is still 15-20%
+# below the target, so add an explicit mean-traction penalty.
+load_mean_weight = 5.0
+
+# SIREN activation settings. The first layer uses a higher frequency so the
+# network can represent sharp groove-edge gradients; hidden layers stay gentler
+# to keep training stable.
+siren_omega_0 = 30.0
+siren_hidden_omega_0 = 1.0
+
+def get_const_weight(epoch):
+    if epoch <= const_ramp_start:
+        return w_const_pde_start
+    if epoch >= const_ramp_end:
+        return w_const_pde_end
+    t = (epoch - const_ramp_start) / (const_ramp_end - const_ramp_start)
+    return w_const_pde_start + t * (w_const_pde_end - w_const_pde_start)
 
 # =========================================================
 # 5. 输入归一化边界（保持模板风格）
@@ -245,6 +250,40 @@ def sample_groove_edge_interior_points(N_edge):
 
     X_edge = torch.cat(pts_list, dim=0)[:N_edge]
     return X_edge.requires_grad_(True)
+
+def sample_groove_influence_interior_points(N_inf):
+    """
+    Interior PDE points in a wider annular influence zone around the groove.
+    The narrow edge sampler captures the peak, while this sampler helps the
+    network learn the stress diffusion path from the groove into the body.
+    """
+    pts_list = []
+    total = 0
+    rho_min = R_groove
+    rho_max = min(0.135, R_outer - x_groove + 0.035)
+    y_min = max(0.0, y_groove_bottom - 0.035)
+    y_max = H_total
+
+    while total < N_inf:
+        m = max(4 * (N_inf - total), 1024)
+        raw = lhs_tensor(3, m)
+
+        alpha = 2.0 * np.pi * raw[:, 0:1]
+        rho = rho_min + raw[:, 1:2] * (rho_max - rho_min)
+        y = y_min + raw[:, 2:3] * (y_max - y_min)
+
+        x = x_groove + rho * torch.cos(alpha)
+        z = rho * torch.sin(alpha)
+        X = torch.cat([x, y, z], dim=1)
+
+        mask = is_in_solid_torch(X).squeeze(1)
+        X_ok = X[mask]
+
+        pts_list.append(X_ok)
+        total += X_ok.shape[0]
+
+    X_inf = torch.cat(pts_list, dim=0)[:N_inf]
+    return X_inf.requires_grad_(True)
 
 def sample_bottom_loaded(N_b):
     raw = lhs_tensor(2, N_b)
@@ -415,16 +454,18 @@ def is_in_main_sector_torch(X):
     return cond_r & cond_t & cond_y
 
 def get_samples():
-    N_col_uniform = N_col_uniform_train
-    N_col_edge = N_col_edge_train
-    N_b = N_boundary_train
-    N_fix = N_boundary_train
-    N_groove_side = N_boundary_train
-    N_rad = N_boundary_train
+    N_col_uniform = 22000
+    N_col_influence = 8000
+    N_col_edge = 6000
+    N_b = 4000
+    N_fix = 4000
+    N_groove_side = 4000
+    N_rad = 4000
 
     X_col_uniform = sample_interior_points(N_col_uniform)
+    X_col_influence = sample_groove_influence_interior_points(N_col_influence)
     X_col_edge = sample_groove_edge_interior_points(N_col_edge)
-    X_col = torch.cat([X_col_uniform, X_col_edge], dim=0).requires_grad_(True)
+    X_col = torch.cat([X_col_uniform, X_col_influence, X_col_edge], dim=0).requires_grad_(True)
     X_bottom_load = sample_bottom_loaded(N_b)
     X_groove_bottom_fix = sample_groove_bottom_fixed(N_fix)
     X_groove_side_free = sample_groove_side_free(N_groove_side)
@@ -441,18 +482,28 @@ def get_samples():
         X_top_free,
         X_radial_free,
     )
+
+def print_sampling_info():
+    print("[INFO] train collocation samples:")
+    print("       uniform=22000, groove_influence=8000, groove_edge=6000")
+    print("       total interior=36000")
+    print("[INFO] validation collocation samples:")
+    print("       uniform=6500, groove_influence=2500, groove_edge=2000")
+    print("       total interior=11000")
 
 def get_validation_samples():
-    N_col_uniform = N_col_uniform_val
-    N_col_edge = N_col_edge_val
-    N_b = N_boundary_val
-    N_fix = N_boundary_val
-    N_groove_side = N_boundary_val
-    N_rad = N_boundary_val
+    N_col_uniform = 6500
+    N_col_influence = 2500
+    N_col_edge = 2000
+    N_b = 1200
+    N_fix = 1200
+    N_groove_side = 1200
+    N_rad = 1200
 
     X_col_uniform = sample_interior_points(N_col_uniform)
+    X_col_influence = sample_groove_influence_interior_points(N_col_influence)
     X_col_edge = sample_groove_edge_interior_points(N_col_edge)
-    X_col = torch.cat([X_col_uniform, X_col_edge], dim=0).requires_grad_(True)
+    X_col = torch.cat([X_col_uniform, X_col_influence, X_col_edge], dim=0).requires_grad_(True)
     X_bottom_load = sample_bottom_loaded(N_b)
     X_groove_bottom_fix = sample_groove_bottom_fixed(N_fix)
     X_groove_side_free = sample_groove_side_free(N_groove_side)
@@ -471,35 +522,55 @@ def get_validation_samples():
     )
 
 # =========================================================
-# 8. 模型定义（改为 displacement-only）
-# 仅输出：u, v, w
+# 8. 模型定义（整体架构保持不变）
+# 仍然输出：
+# u, v, w, sxx, syy, szz, sxy, syz, sxz
 # =========================================================
 class PINN3D(nn.Module):
-    def __init__(self, layers):
+    def __init__(self, layers, omega_0=siren_omega_0, hidden_omega_0=siren_hidden_omega_0):
         super().__init__()
-        self.activation = nn.SiLU()
+        self.omega_0 = omega_0
+        self.hidden_omega_0 = hidden_omega_0
         self.linears = nn.ModuleList(
             [nn.Linear(layers[i], layers[i + 1]) for i in range(len(layers) - 1)]
         )
 
-        for i in range(len(self.linears) - 1):
-            nn.init.xavier_normal_(self.linears[i].weight.data)
-            nn.init.zeros_(self.linears[i].bias.data)
+        self.init_siren_weights()
 
-        nn.init.xavier_normal_(self.linears[-1].weight.data)
-        nn.init.zeros_(self.linears[-1].bias.data)
+    def init_siren_weights(self):
+        with torch.no_grad():
+            first = self.linears[0]
+            first.weight.uniform_(-1.0 / first.in_features, 1.0 / first.in_features)
+            first.bias.zero_()
+
+            for layer in self.linears[1:-1]:
+                bound = np.sqrt(6.0 / layer.in_features) / self.hidden_omega_0
+                layer.weight.uniform_(-bound, bound)
+                layer.bias.zero_()
+
+            last = self.linears[-1]
+            bound = np.sqrt(6.0 / last.in_features) / self.hidden_omega_0
+            last.weight.uniform_(-bound, bound)
+            last.bias.zero_()
 
     def forward(self, x_in):
         a = 2.0 * (x_in - lb) / (ub - lb) - 1.0
-        for i in range(len(self.linears) - 1):
-            a = self.activation(self.linears[i](a))
+        for i, layer in enumerate(self.linears[:-1]):
+            omega = self.omega_0 if i == 0 else self.hidden_omega_0
+            a = torch.sin(omega * layer(a))
         out = self.linears[-1](a)
 
-        # displacement-only: 只返回物理位移
+        # 位移与应力采用不同参考尺度输出，避免网络在初始化阶段陷入“全零应力”解。
         u = U_REF * out[:, 0:1]
         v = U_REF * out[:, 1:2]
         w = U_REF * out[:, 2:3]
-        return u, v, w
+        sxx = SIGMA_REF * out[:, 3:4]
+        syy = SIGMA_REF * out[:, 4:5]
+        szz = SIGMA_REF * out[:, 5:6]
+        sxy = SIGMA_REF * out[:, 6:7]
+        syz = SIGMA_REF * out[:, 7:8]
+        sxz = SIGMA_REF * out[:, 8:9]
+        return u, v, w, sxx, syy, szz, sxy, syz, sxz
 
 # =========================================================
 # 9. 自适应权重（整体架构保持不变）
@@ -539,32 +610,6 @@ def traction_from_stress(sxx, syy, szz, sxy, syz, sxz, nx, ny, nz):
     tz = sxz * nx + syz * ny + szz * nz
     return tx, ty, tz
 
-def constitutive_response_from_disp(u, v, w, x):
-    gu = get_gradients(u, x)
-    gv = get_gradients(v, x)
-    gw = get_gradients(w, x)
-
-    ux, uy, uz = gu[:, 0:1], gu[:, 1:2], gu[:, 2:3]
-    vx, vy, vz = gv[:, 0:1], gv[:, 1:2], gv[:, 2:3]
-    wx, wy, wz = gw[:, 0:1], gw[:, 1:2], gw[:, 2:3]
-
-    div_u = ux + vy + wz
-
-    sxx = lmda * div_u + 2.0 * mu * ux
-    syy = lmda * div_u + 2.0 * mu * vy
-    szz = lmda * div_u + 2.0 * mu * wz
-    sxy = mu * (uy + vx)
-    syz = mu * (vz + wy)
-    sxz = mu * (uz + wx)
-
-    return {
-        "ux": ux, "uy": uy, "uz": uz,
-        "vx": vx, "vy": vy, "vz": vz,
-        "wx": wx, "wy": wy, "wz": wz,
-        "sxx": sxx, "syy": syy, "szz": szz,
-        "sxy": sxy, "syz": syz, "sxz": sxz,
-    }
-
 def compute_losses(
     model,
     X_col,
@@ -573,50 +618,72 @@ def compute_losses(
     X_groove_side_free,
     X_side_free,
     X_top_free,
-    X_radial_free
+    X_radial_free,
+    const_weight=None
 ):
-    # -----------------------------------------------------
-    # 1. PDE Loss：仅由位移导数生成应力与平衡残差
-    # -----------------------------------------------------
-    u, v, w = model(X_col)
-    resp = constitutive_response_from_disp(u, v, w, X_col)
+    if const_weight is None:
+        const_weight = w_const_pde_end
 
-    gsxx = get_gradients(resp["sxx"], X_col)
-    gsyy = get_gradients(resp["syy"], X_col)
-    gszz = get_gradients(resp["szz"], X_col)
-    gsxy = get_gradients(resp["sxy"], X_col)
-    gsyz = get_gradients(resp["syz"], X_col)
-    gsxz = get_gradients(resp["sxz"], X_col)
+    # -----------------------------------------------------
+    # 1. PDE Loss：平衡方程 + 本构方程
+    # -----------------------------------------------------
+    u, v, w, sxx, syy, szz, sxy, syz, sxz = model(X_col)
+
+    gu = get_gradients(u, X_col)
+    gv = get_gradients(v, X_col)
+    gw = get_gradients(w, X_col)
+
+    ux, uy, uz = gu[:, 0:1], gu[:, 1:2], gu[:, 2:3]
+    vx, vy, vz = gv[:, 0:1], gv[:, 1:2], gv[:, 2:3]
+    wx, wy, wz = gw[:, 0:1], gw[:, 1:2], gw[:, 2:3]
+
+    # 平衡方程 div(sigma)=0
+    gsxx = get_gradients(sxx, X_col)
+    gsyy = get_gradients(syy, X_col)
+    gszz = get_gradients(szz, X_col)
+    gsxy = get_gradients(sxy, X_col)
+    gsyz = get_gradients(syz, X_col)
+    gsxz = get_gradients(sxz, X_col)
 
     res_x = gsxx[:, 0:1] + gsxy[:, 1:2] + gsxz[:, 2:3]
     res_y = gsxy[:, 0:1] + gsyy[:, 1:2] + gsyz[:, 2:3]
     res_z = gsxz[:, 0:1] + gsyz[:, 1:2] + gszz[:, 2:3]
 
+    # 本构方程
+    div_u = ux + vy + wz
+
+    sxx_c = lmda * div_u + 2.0 * mu * ux
+    syy_c = lmda * div_u + 2.0 * mu * vy
+    szz_c = lmda * div_u + 2.0 * mu * wz
+    sxy_c = mu * (uy + vx)
+    syz_c = mu * (vz + wy)
+    sxz_c = mu * (uz + wx)
+
+    loss_const = torch.mean(((sxx_c - sxx) / SIGMA_REF) ** 2) + \
+                 torch.mean(((syy_c - syy) / SIGMA_REF) ** 2) + \
+                 torch.mean(((szz_c - szz) / SIGMA_REF) ** 2) + \
+                 torch.mean(((sxy_c - sxy) / SIGMA_REF) ** 2) + \
+                 torch.mean(((syz_c - syz) / SIGMA_REF) ** 2) + \
+                 torch.mean(((sxz_c - sxz) / SIGMA_REF) ** 2)
+
     loss_eq = torch.mean((res_x / PDE_REF) ** 2) + \
               torch.mean((res_y / PDE_REF) ** 2) + \
               torch.mean((res_z / PDE_REF) ** 2)
 
-    # displacement-only 下不再单独训练 stress head，因此 const 项置零占位
-    loss_const = torch.zeros((), dtype=DTYPE, device=device)
-    loss_pde = loss_eq
+    loss_pde = w_eq_pde * loss_eq + const_weight * loss_const
 
     # -----------------------------------------------------
-    # 2. 底面受力边界
+    # 2. 底面受力边界（代替模板里的 inner pressure）
     # y = 0, outward n = (0,-1,0)
     # prescribed traction = (0, q_load, 0)
     # -----------------------------------------------------
-    u_b, v_b, w_b = model(X_bottom_load)
-    resp_b = constitutive_response_from_disp(u_b, v_b, w_b, X_bottom_load)
+    _, _, _, sxx_b, syy_b, szz_b, sxy_b, syz_b, sxz_b = model(X_bottom_load)
 
     nx_b = torch.zeros((X_bottom_load.shape[0], 1), dtype=DTYPE, device=device)
     ny_b = -torch.ones((X_bottom_load.shape[0], 1), dtype=DTYPE, device=device)
     nz_b = torch.zeros((X_bottom_load.shape[0], 1), dtype=DTYPE, device=device)
 
-    tx_b, ty_b, tz_b = traction_from_stress(
-        resp_b["sxx"], resp_b["syy"], resp_b["szz"],
-        resp_b["sxy"], resp_b["syz"], resp_b["sxz"],
-        nx_b, ny_b, nz_b
-    )
+    tx_b, ty_b, tz_b = traction_from_stress(sxx_b, syy_b, szz_b, sxy_b, syz_b, sxz_b, nx_b, ny_b, nz_b)
 
     target_tx_b = torch.zeros_like(tx_b)
     target_ty_b = torch.full_like(ty_b, q_load)
@@ -626,20 +693,22 @@ def compute_losses(
                                   ((ty_b - target_ty_b) / SIGMA_REF) ** 2 +
                                   ((tz_b - target_tz_b) / SIGMA_REF) ** 2)
     mean_ty_ratio = torch.mean(ty_b) / q_load
+    loss_bottom_mean = (mean_ty_ratio - 1.0) ** 2
+    loss_bottom_load = loss_bottom_load + load_mean_weight * loss_bottom_mean
 
     # -----------------------------------------------------
     # 3. 凹槽底面固定边界
     # -----------------------------------------------------
-    u_fix, v_fix, w_fix = model(X_groove_bottom_fix)
+    u_fix, v_fix, w_fix, _, _, _, _, _, _ = model(X_groove_bottom_fix)
     loss_groove_bottom_fixed = torch.mean((u_fix / U_REF) ** 2 +
                                           (v_fix / U_REF) ** 2 +
                                           (w_fix / U_REF) ** 2)
 
     # -----------------------------------------------------
     # 4. 凹槽侧壁自由边界
+    # rho = R_groove, outward n = ((x-x_groove)/rho, 0, z/rho)
     # -----------------------------------------------------
-    u_g, v_g, w_g = model(X_groove_side_free)
-    resp_g = constitutive_response_from_disp(u_g, v_g, w_g, X_groove_side_free)
+    _, _, _, sxx_g, syy_g, szz_g, sxy_g, syz_g, sxz_g = model(X_groove_side_free)
 
     x_g = X_groove_side_free[:, 0:1]
     z_g = X_groove_side_free[:, 2:3]
@@ -649,11 +718,7 @@ def compute_losses(
     ny_g = torch.zeros_like(nx_g)
     nz_g = z_g / rho_g
 
-    tx_g, ty_g, tz_g = traction_from_stress(
-        resp_g["sxx"], resp_g["syy"], resp_g["szz"],
-        resp_g["sxy"], resp_g["syz"], resp_g["sxz"],
-        nx_g, ny_g, nz_g
-    )
+    tx_g, ty_g, tz_g = traction_from_stress(sxx_g, syy_g, szz_g, sxy_g, syz_g, sxz_g, nx_g, ny_g, nz_g)
 
     loss_groove_side_free = torch.mean((tx_g / SIGMA_REF) ** 2 +
                                        (ty_g / SIGMA_REF) ** 2 +
@@ -662,22 +727,19 @@ def compute_losses(
     # -----------------------------------------------------
     # 5. 内外圆柱侧面自由边界
     # -----------------------------------------------------
-    u_s, v_s, w_s = model(X_side_free)
-    resp_s = constitutive_response_from_disp(u_s, v_s, w_s, X_side_free)
+    _, _, _, sxx_s, syy_s, szz_s, sxy_s, syz_s, sxz_s = model(X_side_free)
 
     x_s = X_side_free[:, 0:1]
     z_s = X_side_free[:, 2:3]
     r_s = torch.sqrt(x_s**2 + z_s**2 + 1e-30)
 
+    # 对内外圆柱面，法向分别可取 ±(x/r, 0, z/r)
+    # 因为目标是 traction=0，符号不会影响平方损失
     nx_s = x_s / r_s
     ny_s = torch.zeros_like(nx_s)
     nz_s = z_s / r_s
 
-    tx_s, ty_s, tz_s = traction_from_stress(
-        resp_s["sxx"], resp_s["syy"], resp_s["szz"],
-        resp_s["sxy"], resp_s["syz"], resp_s["sxz"],
-        nx_s, ny_s, nz_s
-    )
+    tx_s, ty_s, tz_s = traction_from_stress(sxx_s, syy_s, szz_s, sxy_s, syz_s, sxz_s, nx_s, ny_s, nz_s)
 
     loss_side_free = torch.mean((tx_s / SIGMA_REF) ** 2 +
                                 (ty_s / SIGMA_REF) ** 2 +
@@ -685,19 +747,16 @@ def compute_losses(
 
     # -----------------------------------------------------
     # 6. 上表面自由边界
+    # y = H_total, outward n=(0,1,0)
+    # traction = [sxy, syy, syz]
     # -----------------------------------------------------
-    u_t, v_t, w_t = model(X_top_free)
-    resp_t = constitutive_response_from_disp(u_t, v_t, w_t, X_top_free)
+    _, _, _, sxx_t, syy_t, szz_t, sxy_t, syz_t, sxz_t = model(X_top_free)
 
     nx_t = torch.zeros((X_top_free.shape[0], 1), dtype=DTYPE, device=device)
     ny_t = torch.ones((X_top_free.shape[0], 1), dtype=DTYPE, device=device)
     nz_t = torch.zeros((X_top_free.shape[0], 1), dtype=DTYPE, device=device)
 
-    tx_t, ty_t, tz_t = traction_from_stress(
-        resp_t["sxx"], resp_t["syy"], resp_t["szz"],
-        resp_t["sxy"], resp_t["syz"], resp_t["sxz"],
-        nx_t, ny_t, nz_t
-    )
+    tx_t, ty_t, tz_t = traction_from_stress(sxx_t, syy_t, szz_t, sxy_t, syz_t, sxz_t, nx_t, ny_t, nz_t)
 
     loss_top_free = torch.mean((tx_t / SIGMA_REF) ** 2 +
                                (ty_t / SIGMA_REF) ** 2 +
@@ -705,9 +764,11 @@ def compute_losses(
 
     # -----------------------------------------------------
     # 7. 两个径向侧面自由边界
+    # theta = ±theta_half
+    # 法向可取 e_theta = (-sin theta, 0, cos theta)
+    # traction = 0
     # -----------------------------------------------------
-    u_r, v_r, w_r = model(X_radial_free)
-    resp_r = constitutive_response_from_disp(u_r, v_r, w_r, X_radial_free)
+    _, _, _, sxx_r, syy_r, szz_r, sxy_r, syz_r, sxz_r = model(X_radial_free)
 
     x_r = X_radial_free[:, 0:1]
     z_r = X_radial_free[:, 2:3]
@@ -717,11 +778,7 @@ def compute_losses(
     ny_r = torch.zeros_like(nx_r)
     nz_r = torch.cos(theta_r)
 
-    tx_r, ty_r, tz_r = traction_from_stress(
-        resp_r["sxx"], resp_r["syy"], resp_r["szz"],
-        resp_r["sxy"], resp_r["syz"], resp_r["sxz"],
-        nx_r, ny_r, nz_r
-    )
+    tx_r, ty_r, tz_r = traction_from_stress(sxx_r, syy_r, szz_r, sxy_r, syz_r, sxz_r, nx_r, ny_r, nz_r)
 
     loss_radial_free = torch.mean((tx_r / SIGMA_REF) ** 2 +
                                   (ty_r / SIGMA_REF) ** 2 +
@@ -756,7 +813,7 @@ def total_weighted_loss_from_losses(losses, base_w, adapt_w):
 # 11. 主程序（整体架构保持不变）
 # =========================================================
 if __name__ == '__main__':
-    model = PINN3D([3, hidden_features, hidden_features, hidden_features, hidden_features, hidden_features, 3]).to(device=device, dtype=DTYPE)
+    model = PINN3D([3, 192, 192, 192, 192, 192, 9]).to(device=device, dtype=DTYPE)
 
     # 生成数据
     (
@@ -774,23 +831,24 @@ if __name__ == '__main__':
     # free, top free, radial side free. The latest run showed Top/Rad free
     # traction losses staying high, so the free-surface weights are raised
     # while keeping the PDE term explicit through w_eq_pde/w_const_pde.
-    base_w = torch.tensor([1.0, 120.0, 120.0, 20.0, 40.0, 80.0, 60.0], dtype=DTYPE, device=device)
+    base_w = torch.tensor([1.0, 240.0, 120.0, 20.0, 35.0, 50.0, 40.0], dtype=DTYPE, device=device)
 
     # Adam 阶段
     print("Starting Adam training...")
     print(f"[INFO] Adam epochs = {adam_epochs}, milestones = {adam_milestones}")
-    print("[INFO] formulation = displacement-only")
-    print("[INFO] PDE loss = Eq; stress is derived from displacement gradients")
-    print(f"[INFO] adaptive weights enabled = {use_adaptive_weights}")
-    print(f"[INFO] dtype = {DTYPE}, hidden_features = {hidden_features}")
     print(
-        f"[INFO] train samples: interior={N_col_uniform_train + N_col_edge_train}, "
-        f"boundary_each={N_boundary_train}"
+        f"[INFO] PDE loss = {w_eq_pde:g} * Eq + "
+        f"Const weight ramp {w_const_pde_start:g}->{w_const_pde_end:g} "
+        f"(epoch {const_ramp_start}->{const_ramp_end})"
     )
+    print(f"[INFO] bottom load mean penalty weight = {load_mean_weight:g}")
+    print(f"[INFO] adaptive weights enabled = {use_adaptive_weights}")
+    print(f"[INFO] activation = SIREN, omega_0={siren_omega_0:g}, hidden_omega_0={siren_hidden_omega_0:g}")
+    print_sampling_info()
 
     optimizer_adam = optim.Adam(
         model.parameters(),
-        lr=0.001,
+        lr=5.0e-4,
         foreach=False,
         fused=False,
         capturable=(device.type == "cuda")
@@ -814,6 +872,7 @@ if __name__ == '__main__':
 
         optimizer_adam.zero_grad()
 
+        const_weight = get_const_weight(epoch)
         l_pde, l_eq, l_const, l_load, l_fix, l_gside, l_side, l_top, l_rad, mean_ty_ratio = compute_losses(
             model,
             X_col,
@@ -822,7 +881,8 @@ if __name__ == '__main__':
             X_groove_side_free,
             X_side_free,
             X_top_free,
-            X_radial_free
+            X_radial_free,
+            const_weight=const_weight
         )
         loss_list = [l_pde, l_load, l_fix, l_gside, l_side, l_top, l_rad]
 
@@ -861,6 +921,7 @@ if __name__ == '__main__':
             print(
                 f"Ep {epoch:5d} | Total:{loss.item():.4e} | PDE:{l_pde.item():.4e} | "
                 f"Eq:{l_eq.item():.4e} | Const:{l_const.item():.4e} | "
+                f"WConst:{const_weight:.3g} | "
                 f"Load:{l_load.item():.4e} | Fix:{l_fix.item():.4e} | "
                 f"GrooveSide:{l_gside.item():.4e} | Side:{l_side.item():.4e} | "
                 f"Top:{l_top.item():.4e} | Rad:{l_rad.item():.4e} | "
@@ -876,7 +937,12 @@ if __name__ == '__main__':
     # L-BFGS 阶段
     adam_state = copy.deepcopy(model.state_dict())
     validation_samples = get_validation_samples()
-    val_losses_before = compute_losses(model, *validation_samples)
+    lbfgs_const_weight = w_const_pde_end
+    val_losses_before = compute_losses(
+        model,
+        *validation_samples,
+        const_weight=lbfgs_const_weight
+    )
     val_loss_before = total_weighted_loss_from_losses(val_losses_before, base_w, adapt_w).detach()
 
     print("\nStarting L-BFGS...")
@@ -886,8 +952,7 @@ if __name__ == '__main__':
     optimizer_lbfgs = torch.optim.LBFGS(
         model.parameters(),
         lr=0.5,
-        max_iter=lbfgs_max_iter,
-        history_size=lbfgs_history_size,
+        max_iter=2000,
         line_search_fn="strong_wolfe"
     )
 
@@ -904,7 +969,8 @@ if __name__ == '__main__':
             X_groove_side_free,
             X_side_free,
             X_top_free,
-            X_radial_free
+            X_radial_free,
+            const_weight=lbfgs_const_weight
         )
 
         loss = (
@@ -927,7 +993,11 @@ if __name__ == '__main__':
 
     optimizer_lbfgs.step(closure)
 
-    val_losses_after = compute_losses(model, *validation_samples)
+    val_losses_after = compute_losses(
+        model,
+        *validation_samples,
+        const_weight=lbfgs_const_weight
+    )
     val_loss_after = total_weighted_loss_from_losses(val_losses_after, base_w, final_w).detach()
     print(f"[L-BFGS] validation loss after  = {val_loss_after.item():.4e}")
 
@@ -939,6 +1009,6 @@ if __name__ == '__main__':
 
     print("Training Finished.")
 
-    save_path = "pinn_sector_groove_disp_only_model.pth"
+    save_path = "pinn_sector_groove_siren_model.pth"
     torch.save(model.state_dict(), save_path)
     print(f"模型权重已成功保存至: {save_path}")

@@ -2,12 +2,12 @@ import torch
 import torch.nn as nn
 import torch.optim as optim
 import numpy as np
-from pyDOE2 import lhs
-from torch.optim.lr_scheduler import MultiStepLR
+from torch.optim.lr_scheduler import ReduceLROnPlateau
 import matplotlib.pyplot as plt
 import os
 import copy
 from time import time
+from 采样 import configure_sampling, get_samples, get_validation_samples, print_sampling_info
 
 # =========================================================
 # 0. 硬件与全局设置
@@ -15,11 +15,11 @@ from time import time
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 os.environ["KMP_DUPLICATE_LIB_OK"] = "TRUE"
 
-# 建议使用 float64，适合固体力学 PINN
-DTYPE = torch.float64
+# 使用 float32，训练速度和显存占用更适合大批量采样
+DTYPE = torch.float32
 torch.set_default_dtype(DTYPE)
 
-# 关闭 TF32，避免双精度/高阶导数时出现额外数值扰动
+# 关闭 TF32，保持标准 float32 计算路径
 torch.backends.cuda.matmul.allow_tf32 = False
 torch.backends.cudnn.allow_tf32 = False
 
@@ -58,6 +58,20 @@ R_groove = 0.05
 y_groove_bottom = 0.05
 y_groove_top = 0.07
 
+configure_sampling(
+    device_in=device,
+    dtype_in=DTYPE,
+    R_inner_in=R_inner,
+    R_outer_in=R_outer,
+    H_total_in=H_total,
+    theta_min_in=theta_min,
+    theta_max_in=theta_max,
+    x_groove_in=x_groove,
+    R_groove_in=R_groove,
+    y_groove_bottom_in=y_groove_bottom,
+    y_groove_top_in=y_groove_top,
+)
+
 # =========================================================
 # 3. 载荷参数
 # 底面 y=0 施加沿 +Y 的总力 F_total，换算为均布面力 q_load
@@ -89,12 +103,9 @@ print(f"[INFO] PDE_REF     = {PDE_REF:.6e} Pa/m")
 # =========================================================
 resample_every = 50
 adam_epochs = 2000
-adam_milestones = [800, 1400, 1800]
-
-# The boundary terms converge quickly in this case. Keeping the adaptive
-# GradNorm-style weights on tends to keep amplifying already-small boundary
-# losses, so the default run uses fixed, PDE-focused weights.
-use_adaptive_weights = False
+plateau_patience = 120
+plateau_factor = 0.5
+plateau_min_lr = 1.0e-6
 
 # PDE = equilibrium + constitutive consistency. The raw Eq term is the main
 # bottleneck in the current logs, so keep it explicit. The constitutive term
@@ -110,12 +121,6 @@ const_ramp_end = 1600
 # traction MSE can look modest even when the mean traction is still 15-20%
 # below the target, so add an explicit mean-traction penalty.
 load_mean_weight = 5.0
-
-# SIREN activation settings. The first layer uses a higher frequency so the
-# network can represent sharp groove-edge gradients; hidden layers stay gentler
-# to keep training stable.
-siren_omega_0 = 30.0
-siren_hidden_omega_0 = 1.0
 
 def get_const_weight(epoch):
     if epoch <= const_ramp_start:
@@ -133,431 +138,29 @@ lb = torch.tensor([-R_outer, 0.0, -R_outer], dtype=DTYPE, device=device)
 ub = torch.tensor([ R_outer, H_total, R_outer], dtype=DTYPE, device=device)
 
 # =========================================================
-# 6. 几何辅助函数
-# =========================================================
-def lhs_tensor(dim, n):
-    n = int(n)
-    if n <= 0:
-        return torch.empty((0, dim), dtype=DTYPE, device=device)
-    return torch.tensor(lhs(dim, n), dtype=DTYPE, device=device)
-
-def to_cartesian(r, theta, y):
-    """
-    扇形模型使用：
-        x = r cos(theta)
-        y = y
-        z = r sin(theta)
-    """
-    x = r * torch.cos(theta)
-    z = r * torch.sin(theta)
-    return torch.cat([x, y, z], dim=1)
-
-def groove_rho_torch(x, z):
-    return torch.sqrt((x - x_groove) ** 2 + z ** 2 + 1e-30)
-
-def is_in_groove_void_torch(X):
-    """
-    判断点是否在凹槽空腔内部
-    """
-    x = X[:, 0:1]
-    y = X[:, 1:2]
-    z = X[:, 2:3]
-    rho = groove_rho_torch(x, z)
-    cond_r = rho <= R_groove
-    cond_y = (y >= y_groove_bottom) & (y <= y_groove_top)
-    return cond_r & cond_y
-
-def is_in_main_sector_torch(X):
-    """
-    判断点是否在主体扇环柱内部（未扣除凹槽）
-    """
-    x = X[:, 0:1]
-    y = X[:, 1:2]
-    z = X[:, 2:3]
-
-    r = torch.sqrt(x**2 + z**2 + 1e-30)
-    theta = torch.atan2(z, x)
-
-    cond_r = (r >= R_inner) & (r <= R_outer)
-    cond_t = (theta >= theta_min) & (theta <= theta_max)
-    cond_y = (y >= 0.0) & (y <= H_total)
-    return cond_r & cond_t & cond_y
-
-def is_in_solid_torch(X):
-    return is_in_main_sector_torch(X) & (~is_in_groove_void_torch(X))
-
-# =========================================================
-# 7. 数据采样（保持模板 get_samples 架构）
-# 返回 7 组点，保持模板整体结构不变
-#
-# X_col          : 内部配点
-# X_bottom_load  : 底面受力边界
-# X_groove_bottom_fix : 凹槽底面固定边界
-# X_groove_side_free  : 凹槽侧壁自由边界
-# X_side_free    : 内外圆柱侧面自由边界
-# X_top_free     : 上表面自由边界（去掉凹槽开口）
-# X_radial_free  : 两个扇形径向侧面自由边界
-# =========================================================
-def sample_interior_points(N_col):
-    pts_list = []
-    total = 0
-    while total < N_col:
-        m = max(2 * (N_col - total), 1024)
-        raw = lhs_tensor(3, m)
-
-        r = torch.sqrt(raw[:, 0:1] * (R_outer**2 - R_inner**2) + R_inner**2)
-        theta = theta_min + raw[:, 1:2] * (theta_max - theta_min)
-        y = raw[:, 2:3] * H_total
-
-        X = to_cartesian(r, theta, y)
-        mask = is_in_solid_torch(X).squeeze(1)
-        X_ok = X[mask]
-
-        pts_list.append(X_ok)
-        total += X_ok.shape[0]
-
-    X_col = torch.cat(pts_list, dim=0)[:N_col]
-    return X_col.requires_grad_(True)
-
-def sample_groove_edge_interior_points(N_edge):
-    """
-    Interior collocation points concentrated near the re-entrant groove bottom
-    edge: rho ~= R_groove, y ~= y_groove_bottom. This is where the stress field
-    changes fastest, so uniform interior sampling under-resolves it.
-    """
-    pts_list = []
-    total = 0
-    radial_span = 0.008
-    vertical_span = 0.006
-
-    while total < N_edge:
-        m = max(4 * (N_edge - total), 1024)
-        raw = lhs_tensor(3, m)
-
-        alpha = 2.0 * np.pi * raw[:, 0:1]
-        rho = R_groove + (2.0 * raw[:, 1:2] - 1.0) * radial_span
-        y = y_groove_bottom + (2.0 * raw[:, 2:3] - 1.0) * vertical_span
-
-        x = x_groove + rho * torch.cos(alpha)
-        z = rho * torch.sin(alpha)
-        X = torch.cat([x, y, z], dim=1)
-
-        mask = is_in_solid_torch(X).squeeze(1)
-        X_ok = X[mask]
-
-        pts_list.append(X_ok)
-        total += X_ok.shape[0]
-
-    X_edge = torch.cat(pts_list, dim=0)[:N_edge]
-    return X_edge.requires_grad_(True)
-
-def sample_groove_influence_interior_points(N_inf):
-    """
-    Interior PDE points in a wider annular influence zone around the groove.
-    The narrow edge sampler captures the peak, while this sampler helps the
-    network learn the stress diffusion path from the groove into the body.
-    """
-    pts_list = []
-    total = 0
-    rho_min = R_groove
-    rho_max = min(0.135, R_outer - x_groove + 0.035)
-    y_min = max(0.0, y_groove_bottom - 0.035)
-    y_max = H_total
-
-    while total < N_inf:
-        m = max(4 * (N_inf - total), 1024)
-        raw = lhs_tensor(3, m)
-
-        alpha = 2.0 * np.pi * raw[:, 0:1]
-        rho = rho_min + raw[:, 1:2] * (rho_max - rho_min)
-        y = y_min + raw[:, 2:3] * (y_max - y_min)
-
-        x = x_groove + rho * torch.cos(alpha)
-        z = rho * torch.sin(alpha)
-        X = torch.cat([x, y, z], dim=1)
-
-        mask = is_in_solid_torch(X).squeeze(1)
-        X_ok = X[mask]
-
-        pts_list.append(X_ok)
-        total += X_ok.shape[0]
-
-    X_inf = torch.cat(pts_list, dim=0)[:N_inf]
-    return X_inf.requires_grad_(True)
-
-def sample_bottom_loaded(N_b):
-    raw = lhs_tensor(2, N_b)
-    r = torch.sqrt(raw[:, 0:1] * (R_outer**2 - R_inner**2) + R_inner**2)
-    theta = theta_min + raw[:, 1:2] * (theta_max - theta_min)
-    y = torch.zeros((N_b, 1), dtype=DTYPE, device=device)
-    X = to_cartesian(r, theta, y)
-    return X.requires_grad_(True)
-
-def sample_groove_bottom(Nb):
-    pts_list = []
-    total = 0
-    while total < Nb:
-        m = max(2 * (Nb - total), 256)
-        raw = lhs_tensor(2, m)
-        rho = torch.sqrt(raw[:, 0:1]) * R_groove
-        alpha = 2.0 * np.pi * raw[:, 1:2]
-
-        x = x_groove + rho * torch.cos(alpha)
-        z = rho * torch.sin(alpha)
-        y = torch.full((m, 1), y_groove_bottom, dtype=DTYPE, device=device)
-        X = torch.cat([x, y, z], dim=1)
-
-        mask = is_in_main_sector_torch(X).squeeze(1)
-        X_ok = X[mask]
-
-        pts_list.append(X_ok)
-        total += X_ok.shape[0]
-
-    X = torch.cat(pts_list, dim=0)[:Nb]
-    return X
-
-def sample_groove_side(Ns):
-    pts_list = []
-    total = 0
-    while total < Ns:
-        m = max(2 * (Ns - total), 256)
-        raw = lhs_tensor(2, m)
-        alpha = 2.0 * np.pi * raw[:, 0:1]
-        y = y_groove_bottom + raw[:, 1:2] * (y_groove_top - y_groove_bottom)
-
-        x = x_groove + R_groove * torch.cos(alpha)
-        z = R_groove * torch.sin(alpha)
-        X = torch.cat([x, y, z], dim=1)
-
-        mask = is_in_main_sector_torch(X).squeeze(1)
-        X_ok = X[mask]
-
-        pts_list.append(X_ok)
-        total += X_ok.shape[0]
-
-    X = torch.cat(pts_list, dim=0)[:Ns]
-    return X
-
-def sample_groove_bottom_fixed(N_fix):
-    """
-    固定边界仅为凹槽底面 y = y_groove_bottom。
-    """
-    X = sample_groove_bottom(N_fix)
-    return X.requires_grad_(True)
-
-def sample_groove_side_free(Ns):
-    """
-    凹槽侧壁自由边界：
-    sqrt((x-x_groove)^2 + z^2) = R_groove, y in [y_groove_bottom, y_groove_top]
-    """
-    X = sample_groove_side(Ns)
-    return X.requires_grad_(True)
-
-def sample_side_free(N_side):
-    """
-    内外圆柱面自由边界
-    """
-    N_each = N_side // 2
-
-    raw_out = lhs_tensor(2, N_each)
-    theta_out = theta_min + raw_out[:, 0:1] * (theta_max - theta_min)
-    y_out = raw_out[:, 1:2] * H_total
-    r_out = torch.full((N_each, 1), R_outer, dtype=DTYPE, device=device)
-    X_outer = to_cartesian(r_out, theta_out, y_out)
-
-    raw_in = lhs_tensor(2, N_side - N_each)
-    theta_in = theta_min + raw_in[:, 0:1] * (theta_max - theta_min)
-    y_in = raw_in[:, 1:2] * H_total
-    r_in = torch.full((N_side - N_each, 1), R_inner, dtype=DTYPE, device=device)
-    X_inner = to_cartesian(r_in, theta_in, y_in)
-
-    X = torch.cat([X_outer, X_inner], dim=0)
-    return X.requires_grad_(True)
-
-def sample_top_free(N_top):
-    """
-    上表面 y=H_total，自由边界，但需剔除凹槽开口
-    """
-    pts_list = []
-    total = 0
-    while total < N_top:
-        m = max(2 * (N_top - total), 512)
-        raw = lhs_tensor(2, m)
-        r = torch.sqrt(raw[:, 0:1] * (R_outer**2 - R_inner**2) + R_inner**2)
-        theta = theta_min + raw[:, 1:2] * (theta_max - theta_min)
-        y = torch.full((m, 1), H_total, dtype=DTYPE, device=device)
-
-        X = to_cartesian(r, theta, y)
-
-        # 顶面固体区域要去掉凹槽开口
-        mask = is_in_solid_torch(X).squeeze(1)
-        X_ok = X[mask]
-
-        pts_list.append(X_ok)
-        total += X_ok.shape[0]
-
-    X = torch.cat(pts_list, dim=0)[:N_top]
-    return X.requires_grad_(True)
-
-def sample_radial_free(N_rad):
-    """
-    两个扇形径向侧面：theta = ±theta_half
-    这里不需要递归补点，也不需要用 is_in_solid_torch 过滤。
-    原因：凹槽不会与这两个径向侧面相交。
-    """
-    N_rad = int(N_rad)
-    if N_rad <= 0:
-        return torch.empty((0, 3), dtype=DTYPE, device=device, requires_grad=True)
-
-    N_each = N_rad // 2
-    N_rem = N_rad - N_each
-
-    # theta = theta_min 面
-    raw1 = lhs_tensor(2, N_each)
-    if N_each > 0:
-        r1 = torch.sqrt(raw1[:, 0:1] * (R_outer**2 - R_inner**2) + R_inner**2)
-        y1 = raw1[:, 1:2] * H_total
-        th1 = torch.full((N_each, 1), theta_min, dtype=DTYPE, device=device)
-        X1 = to_cartesian(r1, th1, y1)
-    else:
-        X1 = torch.empty((0, 3), dtype=DTYPE, device=device)
-
-    # theta = theta_max 面
-    raw2 = lhs_tensor(2, N_rem)
-    if N_rem > 0:
-        r2 = torch.sqrt(raw2[:, 0:1] * (R_outer**2 - R_inner**2) + R_inner**2)
-        y2 = raw2[:, 1:2] * H_total
-        th2 = torch.full((N_rem, 1), theta_max, dtype=DTYPE, device=device)
-        X2 = to_cartesian(r2, th2, y2)
-    else:
-        X2 = torch.empty((0, 3), dtype=DTYPE, device=device)
-
-    X = torch.cat([X1, X2], dim=0)
-    return X.requires_grad_(True)
-
-def is_in_main_sector_torch(X):
-    """
-    判断点是否在主体扇环柱内部（未扣除凹槽）
-    """
-    EPS = 1e-10
-
-    x = X[:, 0:1]
-    y = X[:, 1:2]
-    z = X[:, 2:3]
-
-    r = torch.sqrt(x**2 + z**2 + 1e-30)
-    theta = torch.atan2(z, x)
-
-    cond_r = (r >= R_inner - EPS) & (r <= R_outer + EPS)
-    cond_t = (theta >= theta_min - EPS) & (theta <= theta_max + EPS)
-    cond_y = (y >= 0.0 - EPS) & (y <= H_total + EPS)
-    return cond_r & cond_t & cond_y
-
-def get_samples():
-    N_col_uniform = 22000
-    N_col_influence = 8000
-    N_col_edge = 6000
-    N_b = 4000
-    N_fix = 4000
-    N_groove_side = 4000
-    N_rad = 4000
-
-    X_col_uniform = sample_interior_points(N_col_uniform)
-    X_col_influence = sample_groove_influence_interior_points(N_col_influence)
-    X_col_edge = sample_groove_edge_interior_points(N_col_edge)
-    X_col = torch.cat([X_col_uniform, X_col_influence, X_col_edge], dim=0).requires_grad_(True)
-    X_bottom_load = sample_bottom_loaded(N_b)
-    X_groove_bottom_fix = sample_groove_bottom_fixed(N_fix)
-    X_groove_side_free = sample_groove_side_free(N_groove_side)
-    X_side_free = sample_side_free(N_b)
-    X_top_free = sample_top_free(N_b)
-    X_radial_free = sample_radial_free(N_rad)
-
-    return (
-        X_col,
-        X_bottom_load,
-        X_groove_bottom_fix,
-        X_groove_side_free,
-        X_side_free,
-        X_top_free,
-        X_radial_free,
-    )
-
-def print_sampling_info():
-    print("[INFO] train collocation samples:")
-    print("       uniform=22000, groove_influence=8000, groove_edge=6000")
-    print("       total interior=36000")
-    print("[INFO] validation collocation samples:")
-    print("       uniform=6500, groove_influence=2500, groove_edge=2000")
-    print("       total interior=11000")
-
-def get_validation_samples():
-    N_col_uniform = 6500
-    N_col_influence = 2500
-    N_col_edge = 2000
-    N_b = 1200
-    N_fix = 1200
-    N_groove_side = 1200
-    N_rad = 1200
-
-    X_col_uniform = sample_interior_points(N_col_uniform)
-    X_col_influence = sample_groove_influence_interior_points(N_col_influence)
-    X_col_edge = sample_groove_edge_interior_points(N_col_edge)
-    X_col = torch.cat([X_col_uniform, X_col_influence, X_col_edge], dim=0).requires_grad_(True)
-    X_bottom_load = sample_bottom_loaded(N_b)
-    X_groove_bottom_fix = sample_groove_bottom_fixed(N_fix)
-    X_groove_side_free = sample_groove_side_free(N_groove_side)
-    X_side_free = sample_side_free(N_b)
-    X_top_free = sample_top_free(N_b)
-    X_radial_free = sample_radial_free(N_rad)
-
-    return (
-        X_col,
-        X_bottom_load,
-        X_groove_bottom_fix,
-        X_groove_side_free,
-        X_side_free,
-        X_top_free,
-        X_radial_free,
-    )
-
-# =========================================================
-# 8. 模型定义（整体架构保持不变）
+# 6. 模型定义（整体架构保持不变）
 # 仍然输出：
 # u, v, w, sxx, syy, szz, sxy, syz, sxz
 # =========================================================
 class PINN3D(nn.Module):
-    def __init__(self, layers, omega_0=siren_omega_0, hidden_omega_0=siren_hidden_omega_0):
+    def __init__(self, layers):
         super().__init__()
-        self.omega_0 = omega_0
-        self.hidden_omega_0 = hidden_omega_0
+        self.activation = nn.SiLU()
         self.linears = nn.ModuleList(
             [nn.Linear(layers[i], layers[i + 1]) for i in range(len(layers) - 1)]
         )
 
-        self.init_siren_weights()
+        for i in range(len(self.linears) - 1):
+            nn.init.xavier_normal_(self.linears[i].weight.data)
+            nn.init.zeros_(self.linears[i].bias.data)
 
-    def init_siren_weights(self):
-        with torch.no_grad():
-            first = self.linears[0]
-            first.weight.uniform_(-1.0 / first.in_features, 1.0 / first.in_features)
-            first.bias.zero_()
-
-            for layer in self.linears[1:-1]:
-                bound = np.sqrt(6.0 / layer.in_features) / self.hidden_omega_0
-                layer.weight.uniform_(-bound, bound)
-                layer.bias.zero_()
-
-            last = self.linears[-1]
-            bound = np.sqrt(6.0 / last.in_features) / self.hidden_omega_0
-            last.weight.uniform_(-bound, bound)
-            last.bias.zero_()
+        nn.init.xavier_normal_(self.linears[-1].weight.data)
+        nn.init.zeros_(self.linears[-1].bias.data)
 
     def forward(self, x_in):
         a = 2.0 * (x_in - lb) / (ub - lb) - 1.0
-        for i, layer in enumerate(self.linears[:-1]):
-            omega = self.omega_0 if i == 0 else self.hidden_omega_0
-            a = torch.sin(omega * layer(a))
+        for i in range(len(self.linears) - 1):
+            a = self.activation(self.linears[i](a))
         out = self.linears[-1](a)
 
         # 位移与应力采用不同参考尺度输出，避免网络在初始化阶段陷入“全零应力”解。
@@ -573,32 +176,7 @@ class PINN3D(nn.Module):
         return u, v, w, sxx, syy, szz, sxy, syz, sxz
 
 # =========================================================
-# 9. 自适应权重（整体架构保持不变）
-# =========================================================
-class AdaptiveWeighter:
-    def __init__(self, num_losses, alpha=0.9):
-        self.weights = torch.ones(num_losses, dtype=DTYPE, device=device)
-        self.alpha = alpha
-
-    def update(self, model, losses):
-        last_layer = model.linears[-1].weight
-        grads_norm = []
-        for loss in losses:
-            grad = torch.autograd.grad(loss, last_layer, retain_graph=True)[0]
-            grad_norm = torch.mean(torch.abs(grad))
-            grads_norm.append(grad_norm)
-
-        grads_norm = torch.stack(grads_norm)
-
-        target_weights = grads_norm[0] / (grads_norm + 1e-10)
-        target_weights = torch.clamp(target_weights, min=0.01, max=100.0)
-        target_weights[0] = max(target_weights[0].item(), 1.0)
-
-        self.weights = self.alpha * self.weights + (1 - self.alpha) * target_weights.detach()
-        return self.weights
-
-# =========================================================
-# 10. Loss 计算
+# 9. Loss 计算
 # 六项损失结构不改，只替换成扇形模型对应含义
 # =========================================================
 def get_gradients(u, x):
@@ -797,20 +375,76 @@ def compute_losses(
         mean_ty_ratio.detach(),
     )
 
-def total_weighted_loss_from_losses(losses, base_w, adapt_w):
+def total_weighted_loss_from_losses(losses, base_w):
     l_pde, _, _, l_load, l_fix, l_gside, l_side, l_top, l_rad, _ = losses
     return (
-        base_w[0] * adapt_w[0] * l_pde +
-        base_w[1] * adapt_w[1] * l_load +
-        base_w[2] * adapt_w[2] * l_fix +
-        base_w[3] * adapt_w[3] * l_gside +
-        base_w[4] * adapt_w[4] * l_side +
-        base_w[5] * adapt_w[5] * l_top +
-        base_w[6] * adapt_w[6] * l_rad
+        base_w[0] * l_pde +
+        base_w[1] * l_load +
+        base_w[2] * l_fix +
+        base_w[3] * l_gside +
+        base_w[4] * l_side +
+        base_w[5] * l_top +
+        base_w[6] * l_rad
     )
 
+def _sample_points_for_plot(X, max_points):
+    pts = X.detach().cpu().numpy()
+    if pts.shape[0] <= max_points:
+        return pts
+    idx = np.random.choice(pts.shape[0], max_points, replace=False)
+    return pts[idx]
+
+def show_sampling_points(
+    X_col,
+    X_bottom_load,
+    X_groove_bottom_fix,
+    X_groove_side_free,
+    X_side_free,
+    X_top_free,
+    X_radial_free,
+    max_points_each=2500,
+    save_path="sampling_points_preview.png",
+):
+    groups = [
+        ("Interior", X_col, "#4C78A8", 2),
+        ("Bottom load", X_bottom_load, "#F58518", 8),
+        ("Groove fixed", X_groove_bottom_fix, "#E45756", 10),
+        ("Groove side free", X_groove_side_free, "#72B7B2", 7),
+        ("Inner/outer side free", X_side_free, "#54A24B", 7),
+        ("Top free", X_top_free, "#B279A2", 7),
+        ("Radial free", X_radial_free, "#FF9DA6", 7),
+    ]
+
+    fig = plt.figure(figsize=(11, 8))
+    ax = fig.add_subplot(111, projection="3d")
+
+    for name, X, color, size in groups:
+        pts = _sample_points_for_plot(X, max_points_each)
+        ax.scatter(
+            pts[:, 0],
+            pts[:, 2],
+            pts[:, 1],
+            s=size,
+            c=color,
+            alpha=0.65,
+            label=f"{name} ({X.shape[0]})",
+            depthshade=False,
+        )
+
+    ax.set_xlabel("x (m)")
+    ax.set_ylabel("z (m)")
+    ax.set_zlabel("y (m)")
+    ax.set_title("Sampling Points Before Training")
+    ax.legend(loc="upper left", fontsize=8)
+    ax.view_init(elev=24, azim=-62)
+    ax.set_box_aspect((2.0 * R_outer, 2.0 * R_outer, H_total))
+    plt.tight_layout()
+    fig.savefig(save_path, dpi=220)
+    print(f"[INFO] sampling point preview saved to: {save_path}")
+    plt.show()
+
 # =========================================================
-# 11. 主程序（整体架构保持不变）
+# 10. 主程序（整体架构保持不变）
 # =========================================================
 if __name__ == '__main__':
     model = PINN3D([3, 192, 192, 192, 192, 192, 9]).to(device=device, dtype=DTYPE)
@@ -825,6 +459,15 @@ if __name__ == '__main__':
         X_top_free,
         X_radial_free
     ) = get_samples()
+    show_sampling_points(
+        X_col,
+        X_bottom_load,
+        X_groove_bottom_fix,
+        X_groove_side_free,
+        X_side_free,
+        X_top_free,
+        X_radial_free,
+    )
 
     # 基础权重（保留模板风格）
     # Order: PDE, bottom load, groove fix, groove side free, inner/outer side
@@ -835,27 +478,37 @@ if __name__ == '__main__':
 
     # Adam 阶段
     print("Starting Adam training...")
-    print(f"[INFO] Adam epochs = {adam_epochs}, milestones = {adam_milestones}")
+    print(f"[INFO] Adam epochs = {adam_epochs}")
+    print(
+        f"[INFO] LR scheduler = ReduceLROnPlateau("
+        f"factor={plateau_factor:g}, patience={plateau_patience}, min_lr={plateau_min_lr:g})"
+    )
     print(
         f"[INFO] PDE loss = {w_eq_pde:g} * Eq + "
         f"Const weight ramp {w_const_pde_start:g}->{w_const_pde_end:g} "
         f"(epoch {const_ramp_start}->{const_ramp_end})"
     )
     print(f"[INFO] bottom load mean penalty weight = {load_mean_weight:g}")
-    print(f"[INFO] adaptive weights enabled = {use_adaptive_weights}")
-    print(f"[INFO] activation = SIREN, omega_0={siren_omega_0:g}, hidden_omega_0={siren_hidden_omega_0:g}")
+    print("[INFO] loss weights = fixed base_w")
     print_sampling_info()
 
     optimizer_adam = optim.Adam(
         model.parameters(),
-        lr=5.0e-4,
+        lr=0.001,
         foreach=False,
         fused=False,
         capturable=(device.type == "cuda")
     )
 
-    scheduler = MultiStepLR(optimizer_adam, milestones=adam_milestones, gamma=0.5)
-    weighter = AdaptiveWeighter(num_losses=7, alpha=0.9)
+    scheduler = ReduceLROnPlateau(
+        optimizer_adam,
+        mode="min",
+        factor=plateau_factor,
+        patience=plateau_patience,
+        threshold=1.0e-4,
+        threshold_mode="rel",
+        min_lr=plateau_min_lr,
+    )
 
     t0 = time()
     for epoch in range(adam_epochs + 1):
@@ -884,39 +537,27 @@ if __name__ == '__main__':
             X_radial_free,
             const_weight=const_weight
         )
-        loss_list = [l_pde, l_load, l_fix, l_gside, l_side, l_top, l_rad]
 
-        if use_adaptive_weights and epoch % 100 == 0 and epoch > 0:
-            weighter.update(model, loss_list)
-            if epoch % 500 == 0:
-                w = weighter.weights.detach().cpu().numpy()
-                print(
-                    f"Ep {epoch} | "
-                    f"PDE:{w[0]:.2f} | Load:{w[1]:.2f} | Fix:{w[2]:.2f} | "
-                    f"GrooveSide:{w[3]:.2f} | Side:{w[4]:.2f} | Top:{w[5]:.2f} | Rad:{w[6]:.2f}"
-                )
-
-        adapt_w = weighter.weights if use_adaptive_weights else torch.ones_like(weighter.weights)
         loss = (
-            base_w[0] * adapt_w[0] * l_pde +
-            base_w[1] * adapt_w[1] * l_load +
-            base_w[2] * adapt_w[2] * l_fix +
-            base_w[3] * adapt_w[3] * l_gside +
-            base_w[4] * adapt_w[4] * l_side +
-            base_w[5] * adapt_w[5] * l_top +
-            base_w[6] * adapt_w[6] * l_rad
+            base_w[0] * l_pde +
+            base_w[1] * l_load +
+            base_w[2] * l_fix +
+            base_w[3] * l_gside +
+            base_w[4] * l_side +
+            base_w[5] * l_top +
+            base_w[6] * l_rad
         )
 
         if epoch % 50 == 0:
             elapsed = time() - t0
-            weighted_pde = base_w[0] * adapt_w[0] * l_pde
+            weighted_pde = base_w[0] * l_pde
             weighted_bc = (
-                base_w[1] * adapt_w[1] * l_load +
-                base_w[2] * adapt_w[2] * l_fix +
-                base_w[3] * adapt_w[3] * l_gside +
-                base_w[4] * adapt_w[4] * l_side +
-                base_w[5] * adapt_w[5] * l_top +
-                base_w[6] * adapt_w[6] * l_rad
+                base_w[1] * l_load +
+                base_w[2] * l_fix +
+                base_w[3] * l_gside +
+                base_w[4] * l_side +
+                base_w[5] * l_top +
+                base_w[6] * l_rad
             )
             print(
                 f"Ep {epoch:5d} | Total:{loss.item():.4e} | PDE:{l_pde.item():.4e} | "
@@ -927,12 +568,13 @@ if __name__ == '__main__':
                 f"Top:{l_top.item():.4e} | Rad:{l_rad.item():.4e} | "
                 f"W_PDE:{weighted_pde.item():.4e} | W_BC:{weighted_bc.item():.4e} | "
                 f"mean_ty/q:{mean_ty_ratio.item():.4e} | "
+                f"LR:{optimizer_adam.param_groups[0]['lr']:.3e} | "
                 f"time:{elapsed:.1f}s"
             )
 
         loss.backward()
         optimizer_adam.step()
-        scheduler.step()
+        scheduler.step(loss.detach())
 
     # L-BFGS 阶段
     adam_state = copy.deepcopy(model.state_dict())
@@ -943,11 +585,10 @@ if __name__ == '__main__':
         *validation_samples,
         const_weight=lbfgs_const_weight
     )
-    val_loss_before = total_weighted_loss_from_losses(val_losses_before, base_w, adapt_w).detach()
+    val_loss_before = total_weighted_loss_from_losses(val_losses_before, base_w).detach()
 
     print("\nStarting L-BFGS...")
     print(f"[L-BFGS] validation loss before = {val_loss_before.item():.4e}")
-    final_w = weighter.weights.detach() if use_adaptive_weights else torch.ones_like(weighter.weights)
 
     optimizer_lbfgs = torch.optim.LBFGS(
         model.parameters(),
@@ -974,13 +615,13 @@ if __name__ == '__main__':
         )
 
         loss = (
-            base_w[0] * final_w[0] * l_pde +
-            base_w[1] * final_w[1] * l_load +
-            base_w[2] * final_w[2] * l_fix +
-            base_w[3] * final_w[3] * l_gside +
-            base_w[4] * final_w[4] * l_side +
-            base_w[5] * final_w[5] * l_top +
-            base_w[6] * final_w[6] * l_rad
+            base_w[0] * l_pde +
+            base_w[1] * l_load +
+            base_w[2] * l_fix +
+            base_w[3] * l_gside +
+            base_w[4] * l_side +
+            base_w[5] * l_top +
+            base_w[6] * l_rad
         )
 
         loss.backward()
@@ -998,7 +639,7 @@ if __name__ == '__main__':
         *validation_samples,
         const_weight=lbfgs_const_weight
     )
-    val_loss_after = total_weighted_loss_from_losses(val_losses_after, base_w, final_w).detach()
+    val_loss_after = total_weighted_loss_from_losses(val_losses_after, base_w).detach()
     print(f"[L-BFGS] validation loss after  = {val_loss_after.item():.4e}")
 
     if val_loss_after > 1.05 * val_loss_before:
@@ -1009,6 +650,6 @@ if __name__ == '__main__':
 
     print("Training Finished.")
 
-    save_path = "pinn_sector_groove_siren_model.pth"
+    save_path = "pinn_sector_groove_model.pth"
     torch.save(model.state_dict(), save_path)
     print(f"模型权重已成功保存至: {save_path}")

@@ -20,6 +20,7 @@ from 采样_仅位移 import (
 
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 os.environ["KMP_DUPLICATE_LIB_OK"] = "TRUE"
+SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
 
 DTYPE = torch.float32
 torch.set_default_dtype(DTYPE)
@@ -79,11 +80,15 @@ L_ref = R_outer - R_inner
 SIGMA_REF = q_load
 U_REF = q_load * L_ref / E_val
 PDE_REF = SIGMA_REF / L_ref
+TOTAL_VOLUME = bottom_area * H_total
+ENERGY_REF = SIGMA_REF * U_REF * bottom_area
 
 print(f"[INFO] L_ref       = {L_ref:.6e} m")
 print(f"[INFO] U_REF       = {U_REF:.6e} m")
 print(f"[INFO] SIGMA_REF   = {SIGMA_REF:.6e} Pa")
 print(f"[INFO] PDE_REF     = {PDE_REF:.6e} Pa/m")
+print(f"[INFO] volume      = {TOTAL_VOLUME:.6e} m^3")
+print(f"[INFO] ENERGY_REF  = {ENERGY_REF:.6e} J")
 
 
 resample_every = 50
@@ -102,9 +107,13 @@ w_eq_pde = 10.0
 load_mean_weight = 5.0
 adf_power = 1.0
 stage2_anchor_weight = 0.0
+stage2_objective = "disp_preserve"
+stage2_disp_weight_power = 2.0
+top_blend_fraction = 0.20
+skip_stage2_training = True
 
 use_pretrained_stage1 = True
-pretrained_stage1_path = "pinn_sector_disp_only_model_stage1_soft.pth"
+pretrained_stage1_path = os.path.join(SCRIPT_DIR, "pinn_sector_disp_only_model_stage1_soft.pth")
 
 stage1_base_w = [1.0, 240.0, 1000.0, 20.0, 35.0, 50.0, 40.0]
 stage2_base_w = [1.0, 240.0, 0.0, 20.0, 35.0, 50.0, 40.0]
@@ -115,7 +124,14 @@ ub = torch.tensor([R_outer, H_total, R_outer], dtype=DTYPE, device=device)
 
 
 def top_surface_phi(x_in):
-    return torch.clamp((H_total - x_in[:, 1:2]) / H_total, min=0.0, max=1.0) ** adf_power
+    # Use a localized smoothstep lifting near the top boundary instead of a
+    # full-thickness linear ramp. This avoids a systematic downward bias in the
+    # interior while still giving exact zero displacement on the top surface.
+    top_blend_thickness = max(top_blend_fraction * H_total, 1.0e-6)
+    d_top = torch.clamp(H_total - x_in[:, 1:2], min=0.0)
+    t = torch.clamp(d_top / top_blend_thickness, min=0.0, max=1.0)
+    phi = t * t * (3.0 - 2.0 * t)
+    return phi**adf_power
 
 
 def project_to_top_surface(x_in):
@@ -210,6 +226,7 @@ class HardCorrectionModel(nn.Module):
         self.correction_net = correction_net
         self.reference_model = reference_model
         self.bc_mode = "hard_adf"
+        self.training_objective = stage2_objective
 
         self.base_model.set_bc_mode("soft")
         self.base_model.eval()
@@ -307,6 +324,10 @@ def traction_from_stress(sxx, syy, szz, sxy, syz, sxz, nx, ny, nz):
     ty = sxy * nx + syy * ny + syz * nz
     tz = sxz * nx + syz * ny + szz * nz
     return tx, ty, tz
+
+
+def zero_scalar():
+    return torch.zeros((), dtype=DTYPE, device=device)
 
 
 def compute_losses(
@@ -469,6 +490,395 @@ def compute_losses(
     )
 
 
+def compute_bottom_load_diagnostic(model, X_bottom_load, create_graph):
+    _, _, _, sxx_b, syy_b, szz_b, sxy_b, syz_b, sxz_b = evaluate_displacement_and_stress(
+        model,
+        X_bottom_load,
+        create_graph=create_graph,
+    )
+    nx_b = torch.zeros((X_bottom_load.shape[0], 1), dtype=DTYPE, device=device)
+    ny_b = -torch.ones((X_bottom_load.shape[0], 1), dtype=DTYPE, device=device)
+    nz_b = torch.zeros((X_bottom_load.shape[0], 1), dtype=DTYPE, device=device)
+    tx_b, ty_b, tz_b = traction_from_stress(sxx_b, syy_b, szz_b, sxy_b, syz_b, sxz_b, nx_b, ny_b, nz_b)
+    target_tx_b = torch.zeros_like(tx_b)
+    target_ty_b = torch.full_like(ty_b, q_load)
+    target_tz_b = torch.zeros_like(tz_b)
+    loss_bottom_load = torch.mean(
+        ((tx_b - target_tx_b) / SIGMA_REF) ** 2
+        + ((ty_b - target_ty_b) / SIGMA_REF) ** 2
+        + ((tz_b - target_tz_b) / SIGMA_REF) ** 2
+    )
+    mean_ty_ratio = torch.mean(ty_b) / q_load
+    loss_bottom_load = loss_bottom_load + load_mean_weight * (mean_ty_ratio - 1.0) ** 2
+    return loss_bottom_load, mean_ty_ratio.detach()
+
+
+def compute_stage2_energy_metrics(
+    model,
+    X_col,
+    X_bottom_load,
+    X_groove_bottom_fix,
+    X_groove_side_free,
+    X_side_free,
+    X_top_free,
+    X_radial_free,
+    with_diagnostics=True,
+):
+    u, v, w = model(X_col)
+    stress = stress_from_displacement(u, v, w, X_col, create_graph=True)
+
+    ux = stress["ux"]
+    uy = stress["uy"]
+    uz = stress["uz"]
+    vx = stress["vx"]
+    vy = stress["vy"]
+    vz = stress["vz"]
+    wx = stress["wx"]
+    wy = stress["wy"]
+    wz = stress["wz"]
+
+    div_u = ux + vy + wz
+    eps_xy = 0.5 * (uy + vx)
+    eps_yz = 0.5 * (vz + wy)
+    eps_xz = 0.5 * (uz + wx)
+
+    strain_energy_density = 0.5 * lmda * div_u**2 + mu * (
+        ux**2 + vy**2 + wz**2 + 2.0 * eps_xy**2 + 2.0 * eps_yz**2 + 2.0 * eps_xz**2
+    )
+    internal_energy = torch.mean(strain_energy_density) * TOTAL_VOLUME
+
+    _, v_bottom, _ = model(X_bottom_load)
+    external_work = torch.mean(q_load * v_bottom) * bottom_area
+
+    loss_energy = (internal_energy - external_work) / ENERGY_REF
+    internal_energy_norm = internal_energy / ENERGY_REF
+    external_work_norm = external_work / ENERGY_REF
+
+    if with_diagnostics:
+        loss_bottom_load, mean_ty_ratio = compute_bottom_load_diagnostic(
+            model,
+            X_bottom_load,
+            create_graph=False,
+        )
+
+        u_fix, v_fix, w_fix = model(X_groove_bottom_fix)
+        loss_groove_bottom_fixed = torch.mean(
+            (u_fix / U_REF) ** 2 + (v_fix / U_REF) ** 2 + (w_fix / U_REF) ** 2
+        )
+
+        if X_groove_side_free.shape[0] == 0:
+            loss_groove_side_free = zero_scalar()
+        else:
+            _, _, _, sxx_g, syy_g, szz_g, sxy_g, syz_g, sxz_g = evaluate_displacement_and_stress(
+                model,
+                X_groove_side_free,
+                create_graph=False,
+            )
+            x_g = X_groove_side_free[:, 0:1]
+            z_g = X_groove_side_free[:, 2:3]
+            rho_g = torch.sqrt((x_g - x_groove) ** 2 + z_g**2 + 1e-30)
+            nx_g = (x_g - x_groove) / rho_g
+            ny_g = torch.zeros_like(nx_g)
+            nz_g = z_g / rho_g
+            tx_g, ty_g, tz_g = traction_from_stress(sxx_g, syy_g, szz_g, sxy_g, syz_g, sxz_g, nx_g, ny_g, nz_g)
+            loss_groove_side_free = torch.mean(
+                (tx_g / SIGMA_REF) ** 2 + (ty_g / SIGMA_REF) ** 2 + (tz_g / SIGMA_REF) ** 2
+            )
+
+        _, _, _, sxx_s, syy_s, szz_s, sxy_s, syz_s, sxz_s = evaluate_displacement_and_stress(
+            model,
+            X_side_free,
+            create_graph=False,
+        )
+        x_s = X_side_free[:, 0:1]
+        z_s = X_side_free[:, 2:3]
+        r_s = torch.sqrt(x_s**2 + z_s**2 + 1e-30)
+        nx_s = x_s / r_s
+        ny_s = torch.zeros_like(nx_s)
+        nz_s = z_s / r_s
+        tx_s, ty_s, tz_s = traction_from_stress(sxx_s, syy_s, szz_s, sxy_s, syz_s, sxz_s, nx_s, ny_s, nz_s)
+        loss_side_free = torch.mean(
+            (tx_s / SIGMA_REF) ** 2 + (ty_s / SIGMA_REF) ** 2 + (tz_s / SIGMA_REF) ** 2
+        )
+
+        if X_top_free.shape[0] == 0:
+            loss_top_free = zero_scalar()
+        else:
+            _, _, _, sxx_t, syy_t, szz_t, sxy_t, syz_t, sxz_t = evaluate_displacement_and_stress(
+                model,
+                X_top_free,
+                create_graph=False,
+            )
+            nx_t = torch.zeros((X_top_free.shape[0], 1), dtype=DTYPE, device=device)
+            ny_t = torch.ones((X_top_free.shape[0], 1), dtype=DTYPE, device=device)
+            nz_t = torch.zeros((X_top_free.shape[0], 1), dtype=DTYPE, device=device)
+            tx_t, ty_t, tz_t = traction_from_stress(sxx_t, syy_t, szz_t, sxy_t, syz_t, sxz_t, nx_t, ny_t, nz_t)
+            loss_top_free = torch.mean(
+                (tx_t / SIGMA_REF) ** 2 + (ty_t / SIGMA_REF) ** 2 + (tz_t / SIGMA_REF) ** 2
+            )
+
+        _, _, _, sxx_r, syy_r, szz_r, sxy_r, syz_r, sxz_r = evaluate_displacement_and_stress(
+            model,
+            X_radial_free,
+            create_graph=False,
+        )
+        x_r = X_radial_free[:, 0:1]
+        z_r = X_radial_free[:, 2:3]
+        theta_r = torch.atan2(z_r, x_r)
+        nx_r = -torch.sin(theta_r)
+        ny_r = torch.zeros_like(nx_r)
+        nz_r = torch.cos(theta_r)
+        tx_r, ty_r, tz_r = traction_from_stress(sxx_r, syy_r, szz_r, sxy_r, syz_r, sxz_r, nx_r, ny_r, nz_r)
+        loss_radial_free = torch.mean(
+            (tx_r / SIGMA_REF) ** 2 + (ty_r / SIGMA_REF) ** 2 + (tz_r / SIGMA_REF) ** 2
+        )
+    else:
+        loss_bottom_load = zero_scalar()
+        mean_ty_ratio = torch.tensor(float("nan"), dtype=DTYPE, device=device)
+        loss_groove_bottom_fixed = zero_scalar()
+        loss_groove_side_free = zero_scalar()
+        loss_side_free = zero_scalar()
+        loss_top_free = zero_scalar()
+        loss_radial_free = zero_scalar()
+
+    if stage2_anchor_weight > 0.0 and isinstance(model, HardCorrectionModel) and model.reference_model is not None:
+        with torch.no_grad():
+            u_soft, v_soft, w_soft = model.reference_model(X_col)
+        phi_top_col = top_surface_phi(X_col)
+        anchor_mask = phi_top_col**2
+        loss_anchor = torch.mean(
+            anchor_mask * ((u - u_soft) / U_REF) ** 2
+            + anchor_mask * ((v - v_soft) / U_REF) ** 2
+            + anchor_mask * ((w - w_soft) / U_REF) ** 2
+        )
+    else:
+        loss_anchor = zero_scalar()
+
+    return {
+        "mode": "energy",
+        "objective": loss_energy + stage2_anchor_weight * loss_anchor,
+        "energy": loss_energy,
+        "internal": internal_energy_norm,
+        "external": external_work_norm,
+        "load": loss_bottom_load,
+        "fix": loss_groove_bottom_fixed,
+        "gside": loss_groove_side_free,
+        "side": loss_side_free,
+        "top": loss_top_free,
+        "rad": loss_radial_free,
+        "anchor": loss_anchor,
+        "w_anchor": stage2_anchor_weight * loss_anchor,
+        "mean_ty_ratio": mean_ty_ratio,
+    }
+
+
+def compute_stage2_disp_preserve_metrics(
+    model,
+    X_col,
+    X_bottom_load,
+    X_groove_bottom_fix,
+    X_groove_side_free,
+    X_side_free,
+    X_top_free,
+    X_radial_free,
+    with_diagnostics=True,
+):
+    if not isinstance(model, HardCorrectionModel):
+        raise TypeError("Displacement-preserve stage2 metrics require HardCorrectionModel.")
+
+    u, v, w = model(X_col)
+    with torch.no_grad():
+        u_soft, v_soft, w_soft = model.reference_model(X_col)
+
+    phi_top_col = top_surface_phi(X_col)
+    preserve_mask = phi_top_col ** stage2_disp_weight_power
+    loss_disp = torch.mean(
+        preserve_mask * ((u - u_soft) / U_REF) ** 2
+        + preserve_mask * ((v - v_soft) / U_REF) ** 2
+        + preserve_mask * ((w - w_soft) / U_REF) ** 2
+    )
+
+    if with_diagnostics:
+        loss_bottom_load, mean_ty_ratio = compute_bottom_load_diagnostic(
+            model,
+            X_bottom_load,
+            create_graph=False,
+        )
+
+        u_fix, v_fix, w_fix = model(X_groove_bottom_fix)
+        loss_groove_bottom_fixed = torch.mean(
+            (u_fix / U_REF) ** 2 + (v_fix / U_REF) ** 2 + (w_fix / U_REF) ** 2
+        )
+
+        if X_groove_side_free.shape[0] == 0:
+            loss_groove_side_free = zero_scalar()
+        else:
+            _, _, _, sxx_g, syy_g, szz_g, sxy_g, syz_g, sxz_g = evaluate_displacement_and_stress(
+                model,
+                X_groove_side_free,
+                create_graph=False,
+            )
+            x_g = X_groove_side_free[:, 0:1]
+            z_g = X_groove_side_free[:, 2:3]
+            rho_g = torch.sqrt((x_g - x_groove) ** 2 + z_g**2 + 1e-30)
+            nx_g = (x_g - x_groove) / rho_g
+            ny_g = torch.zeros_like(nx_g)
+            nz_g = z_g / rho_g
+            tx_g, ty_g, tz_g = traction_from_stress(sxx_g, syy_g, szz_g, sxy_g, syz_g, sxz_g, nx_g, ny_g, nz_g)
+            loss_groove_side_free = torch.mean(
+                (tx_g / SIGMA_REF) ** 2 + (ty_g / SIGMA_REF) ** 2 + (tz_g / SIGMA_REF) ** 2
+            )
+
+        _, _, _, sxx_s, syy_s, szz_s, sxy_s, syz_s, sxz_s = evaluate_displacement_and_stress(
+            model,
+            X_side_free,
+            create_graph=False,
+        )
+        x_s = X_side_free[:, 0:1]
+        z_s = X_side_free[:, 2:3]
+        r_s = torch.sqrt(x_s**2 + z_s**2 + 1e-30)
+        nx_s = x_s / r_s
+        ny_s = torch.zeros_like(nx_s)
+        nz_s = z_s / r_s
+        tx_s, ty_s, tz_s = traction_from_stress(sxx_s, syy_s, szz_s, sxy_s, syz_s, sxz_s, nx_s, ny_s, nz_s)
+        loss_side_free = torch.mean(
+            (tx_s / SIGMA_REF) ** 2 + (ty_s / SIGMA_REF) ** 2 + (tz_s / SIGMA_REF) ** 2
+        )
+
+        if X_top_free.shape[0] == 0:
+            loss_top_free = zero_scalar()
+        else:
+            _, _, _, sxx_t, syy_t, szz_t, sxy_t, syz_t, sxz_t = evaluate_displacement_and_stress(
+                model,
+                X_top_free,
+                create_graph=False,
+            )
+            nx_t = torch.zeros((X_top_free.shape[0], 1), dtype=DTYPE, device=device)
+            ny_t = torch.ones((X_top_free.shape[0], 1), dtype=DTYPE, device=device)
+            nz_t = torch.zeros((X_top_free.shape[0], 1), dtype=DTYPE, device=device)
+            tx_t, ty_t, tz_t = traction_from_stress(sxx_t, syy_t, szz_t, sxy_t, syz_t, sxz_t, nx_t, ny_t, nz_t)
+            loss_top_free = torch.mean(
+                (tx_t / SIGMA_REF) ** 2 + (ty_t / SIGMA_REF) ** 2 + (tz_t / SIGMA_REF) ** 2
+            )
+
+        _, _, _, sxx_r, syy_r, szz_r, sxy_r, syz_r, sxz_r = evaluate_displacement_and_stress(
+            model,
+            X_radial_free,
+            create_graph=False,
+        )
+        x_r = X_radial_free[:, 0:1]
+        z_r = X_radial_free[:, 2:3]
+        theta_r = torch.atan2(z_r, x_r)
+        nx_r = -torch.sin(theta_r)
+        ny_r = torch.zeros_like(nx_r)
+        nz_r = torch.cos(theta_r)
+        tx_r, ty_r, tz_r = traction_from_stress(sxx_r, syy_r, szz_r, sxy_r, syz_r, sxz_r, nx_r, ny_r, nz_r)
+        loss_radial_free = torch.mean(
+            (tx_r / SIGMA_REF) ** 2 + (ty_r / SIGMA_REF) ** 2 + (tz_r / SIGMA_REF) ** 2
+        )
+    else:
+        loss_bottom_load = zero_scalar()
+        mean_ty_ratio = torch.tensor(float("nan"), dtype=DTYPE, device=device)
+        loss_groove_bottom_fixed = zero_scalar()
+        loss_groove_side_free = zero_scalar()
+        loss_side_free = zero_scalar()
+        loss_top_free = zero_scalar()
+        loss_radial_free = zero_scalar()
+
+    return {
+        "mode": "disp_preserve",
+        "objective": loss_disp,
+        "disp": loss_disp,
+        "load": loss_bottom_load,
+        "fix": loss_groove_bottom_fixed,
+        "gside": loss_groove_side_free,
+        "side": loss_side_free,
+        "top": loss_top_free,
+        "rad": loss_radial_free,
+        "anchor": zero_scalar(),
+        "w_anchor": zero_scalar(),
+        "mean_ty_ratio": mean_ty_ratio,
+    }
+
+
+def compute_stage_metrics(
+    model,
+    base_w,
+    X_col,
+    X_bottom_load,
+    X_groove_bottom_fix,
+    X_groove_side_free,
+    X_side_free,
+    X_top_free,
+    X_radial_free,
+    with_diagnostics=True,
+):
+    if getattr(model, "training_objective", "strong_form") == "energy":
+        return compute_stage2_energy_metrics(
+            model,
+            X_col,
+            X_bottom_load,
+            X_groove_bottom_fix,
+            X_groove_side_free,
+            X_side_free,
+            X_top_free,
+            X_radial_free,
+            with_diagnostics=with_diagnostics,
+        )
+    if getattr(model, "training_objective", "strong_form") == "disp_preserve":
+        return compute_stage2_disp_preserve_metrics(
+            model,
+            X_col,
+            X_bottom_load,
+            X_groove_bottom_fix,
+            X_groove_side_free,
+            X_side_free,
+            X_top_free,
+            X_radial_free,
+            with_diagnostics=with_diagnostics,
+        )
+
+    losses = compute_losses(
+        model,
+        X_col,
+        X_bottom_load,
+        X_groove_bottom_fix,
+        X_groove_side_free,
+        X_side_free,
+        X_top_free,
+        X_radial_free,
+    )
+    l_pde, l_eq, l_const, l_load, l_fix, l_gside, l_side, l_top, l_rad, l_anchor, mean_ty_ratio = losses
+    weighted_pde = base_w[0] * l_pde
+    weighted_bc = (
+        base_w[1] * l_load
+        + base_w[2] * l_fix
+        + base_w[3] * l_gside
+        + base_w[4] * l_side
+        + base_w[5] * l_top
+        + base_w[6] * l_rad
+    )
+    weighted_anchor = stage2_anchor_weight * l_anchor
+    return {
+        "mode": "strong_form",
+        "objective": weighted_pde + weighted_bc + weighted_anchor,
+        "pde": l_pde,
+        "eq": l_eq,
+        "const": l_const,
+        "load": l_load,
+        "fix": l_fix,
+        "gside": l_gside,
+        "side": l_side,
+        "top": l_top,
+        "rad": l_rad,
+        "anchor": l_anchor,
+        "w_primary": weighted_pde,
+        "w_bc": weighted_bc,
+        "w_anchor": weighted_anchor,
+        "mean_ty_ratio": mean_ty_ratio,
+    }
+
+
 def total_weighted_loss_from_losses(losses, base_w):
     l_pde, _, _, l_load, l_fix, l_gside, l_side, l_top, l_rad, l_anchor, _ = losses
     return (
@@ -575,7 +985,9 @@ def run_adam_stage(
         factor=plateau_factor,
         patience=plateau_patience,
         threshold=1.0e-4,
-        threshold_mode="rel",
+        threshold_mode=(
+            "abs" if getattr(model, "training_objective", "strong_form") in ("energy", "disp_preserve") else "rel"
+        ),
         min_lr=plateau_min_lr,
     )
 
@@ -590,13 +1002,27 @@ def run_adam_stage(
         f"factor={plateau_factor:g}, patience={plateau_patience}, min_lr={plateau_min_lr:g})"
     )
     print(f"[INFO] {stage_name} Adam lr = {learning_rate:.3e}")
-    print(f"[INFO] PDE loss = {w_eq_pde:g} * Eq")
-    print(f"[INFO] bottom load mean penalty weight = {load_mean_weight:g}")
+    if getattr(model, "training_objective", "strong_form") == "energy":
+        print("[INFO] stage objective = total potential energy (internal - external work)")
+        print("[INFO] natural boundaries are diagnostics only in stage 2")
+        if stage2_anchor_weight > 0.0:
+            print(f"[INFO] anchor weight = {stage2_anchor_weight:g}")
+    elif getattr(model, "training_objective", "strong_form") == "disp_preserve":
+        print("[INFO] stage objective = preserve stage-1 displacement while enforcing exact top Dirichlet BC")
+        print(f"[INFO] displacement preserve mask power = {stage2_disp_weight_power:g}")
+        print(f"[INFO] localized top lifting thickness fraction = {top_blend_fraction:g}")
+        print("[INFO] natural boundaries are diagnostics only in stage 2")
+    else:
+        print(f"[INFO] PDE loss = {w_eq_pde:g} * Eq")
+        print(f"[INFO] bottom load mean penalty weight = {load_mean_weight:g}")
     if getattr(model, "bc_mode", None) == "hard_adf" or isinstance(model, HardCorrectionModel):
         print(f"[INFO] top fixed Dirichlet BC = hard constraint via ADF^p, p={adf_power:g}")
     else:
         print("[INFO] top fixed Dirichlet BC = soft penalty")
-    print(f"[INFO] {stage_name} loss weights = {base_w.detach().cpu().tolist()}")
+    if getattr(model, "training_objective", "strong_form") in ("energy", "disp_preserve"):
+        print(f"[INFO] {stage_name} diagnostics weights (unused by objective) = {base_w.detach().cpu().tolist()}")
+    else:
+        print(f"[INFO] {stage_name} loss weights = {base_w.detach().cpu().tolist()}")
     print_sampling_info()
 
     t0 = time()
@@ -614,8 +1040,9 @@ def run_adam_stage(
 
         optimizer_adam.zero_grad()
 
-        l_pde, l_eq, l_const, l_load, l_fix, l_gside, l_side, l_top, l_rad, l_anchor, mean_ty_ratio = compute_losses(
+        metrics = compute_stage_metrics(
             model,
+            base_w,
             X_col,
             X_bottom_load,
             X_groove_bottom_fix,
@@ -623,43 +1050,44 @@ def run_adam_stage(
             X_side_free,
             X_top_free,
             X_radial_free,
+            with_diagnostics=(epoch % 50 == 0),
         )
-
-        loss = (
-            base_w[0] * l_pde
-            + base_w[1] * l_load
-            + base_w[2] * l_fix
-            + base_w[3] * l_gside
-            + base_w[4] * l_side
-            + base_w[5] * l_top
-            + base_w[6] * l_rad
-            + stage2_anchor_weight * l_anchor
-        )
+        loss = metrics["objective"]
 
         if epoch % 50 == 0:
             elapsed = time() - t0
-            weighted_pde = base_w[0] * l_pde
-            weighted_bc = (
-                base_w[1] * l_load
-                + base_w[2] * l_fix
-                + base_w[3] * l_gside
-                + base_w[4] * l_side
-                + base_w[5] * l_top
-                + base_w[6] * l_rad
-            )
-            weighted_anchor = stage2_anchor_weight * l_anchor
-            print(
-                f"{stage_name} Ep {epoch:5d} | Total:{loss.item():.4e} | PDE:{l_pde.item():.4e} | "
-                f"Eq:{l_eq.item():.4e} | Const:{l_const.item():.4e} | "
-                f"Load:{l_load.item():.4e} | Fix:{l_fix.item():.4e} | "
-                f"GrooveSide:{l_gside.item():.4e} | Side:{l_side.item():.4e} | "
-                f"Top:{l_top.item():.4e} | Rad:{l_rad.item():.4e} | Anchor:{l_anchor.item():.4e} | "
-                f"W_PDE:{weighted_pde.item():.4e} | W_BC:{weighted_bc.item():.4e} | "
-                f"W_Anchor:{weighted_anchor.item():.4e} | "
-                f"mean_ty/q:{mean_ty_ratio.item():.4e} | "
-                f"LR:{optimizer_adam.param_groups[0]['lr']:.3e} | "
-                f"time:{elapsed:.1f}s"
-            )
+            if metrics["mode"] == "energy":
+                print(
+                    f"{stage_name} Ep {epoch:5d} | Total:{loss.item():.4e} | Pi:{metrics['energy'].item():.4e} | "
+                    f"U_int:{metrics['internal'].item():.4e} | W_ext:{metrics['external'].item():.4e} | "
+                    f"Load:{metrics['load'].item():.4e} | Fix:{metrics['fix'].item():.4e} | "
+                    f"GrooveSide:{metrics['gside'].item():.4e} | Side:{metrics['side'].item():.4e} | "
+                    f"Top:{metrics['top'].item():.4e} | Rad:{metrics['rad'].item():.4e} | "
+                    f"Anchor:{metrics['anchor'].item():.4e} | W_Anchor:{metrics['w_anchor'].item():.4e} | "
+                    f"mean_ty/q:{metrics['mean_ty_ratio'].item():.4e} | "
+                    f"LR:{optimizer_adam.param_groups[0]['lr']:.3e} | time:{elapsed:.1f}s"
+                )
+            elif metrics["mode"] == "disp_preserve":
+                print(
+                    f"{stage_name} Ep {epoch:5d} | Total:{loss.item():.4e} | Disp:{metrics['disp'].item():.4e} | "
+                    f"Load:{metrics['load'].item():.4e} | Fix:{metrics['fix'].item():.4e} | "
+                    f"GrooveSide:{metrics['gside'].item():.4e} | Side:{metrics['side'].item():.4e} | "
+                    f"Top:{metrics['top'].item():.4e} | Rad:{metrics['rad'].item():.4e} | "
+                    f"mean_ty/q:{metrics['mean_ty_ratio'].item():.4e} | "
+                    f"LR:{optimizer_adam.param_groups[0]['lr']:.3e} | time:{elapsed:.1f}s"
+                )
+            else:
+                print(
+                    f"{stage_name} Ep {epoch:5d} | Total:{loss.item():.4e} | PDE:{metrics['pde'].item():.4e} | "
+                    f"Eq:{metrics['eq'].item():.4e} | Const:{metrics['const'].item():.4e} | "
+                    f"Load:{metrics['load'].item():.4e} | Fix:{metrics['fix'].item():.4e} | "
+                    f"GrooveSide:{metrics['gside'].item():.4e} | Side:{metrics['side'].item():.4e} | "
+                    f"Top:{metrics['top'].item():.4e} | Rad:{metrics['rad'].item():.4e} | "
+                    f"Anchor:{metrics['anchor'].item():.4e} | W_PDE:{metrics['w_primary'].item():.4e} | "
+                    f"W_BC:{metrics['w_bc'].item():.4e} | W_Anchor:{metrics['w_anchor'].item():.4e} | "
+                    f"mean_ty/q:{metrics['mean_ty_ratio'].item():.4e} | "
+                    f"LR:{optimizer_adam.param_groups[0]['lr']:.3e} | time:{elapsed:.1f}s"
+                )
 
         loss.backward()
         optimizer_adam.step()
@@ -669,8 +1097,8 @@ def run_adam_stage(
 def run_lbfgs_stage(model, *, stage_name, base_w, max_iter):
     adam_state = copy.deepcopy(model.state_dict())
     validation_samples = get_validation_samples()
-    val_losses_before = compute_losses(model, *validation_samples)
-    val_loss_before = total_weighted_loss_from_losses(val_losses_before, base_w).detach()
+    val_metrics_before = compute_stage_metrics(model, base_w, *validation_samples)
+    val_loss_before = val_metrics_before["objective"].detach()
 
     print(f"\nStarting {stage_name} L-BFGS...")
     print(f"[{stage_name} L-BFGS] validation loss before = {val_loss_before.item():.4e}")
@@ -697,8 +1125,9 @@ def run_lbfgs_stage(model, *, stage_name, base_w, max_iter):
     def closure():
         optimizer_lbfgs.zero_grad()
 
-        l_pde, _, _, l_load, l_fix, l_gside, l_side, l_top, l_rad, l_anchor, _ = compute_losses(
+        metrics = compute_stage_metrics(
             model,
+            base_w,
             X_col,
             X_bottom_load,
             X_groove_bottom_fix,
@@ -706,34 +1135,38 @@ def run_lbfgs_stage(model, *, stage_name, base_w, max_iter):
             X_side_free,
             X_top_free,
             X_radial_free,
+            with_diagnostics=False,
         )
-
-        loss_local = (
-            base_w[0] * l_pde
-            + base_w[1] * l_load
-            + base_w[2] * l_fix
-            + base_w[3] * l_gside
-            + base_w[4] * l_side
-            + base_w[5] * l_top
-            + base_w[6] * l_rad
-            + stage2_anchor_weight * l_anchor
-        )
+        loss_local = metrics["objective"]
 
         loss_local.backward()
         iter_count[0] += 1
 
         if iter_count[0] % 20 == 0:
-            print(f"{stage_name} L-BFGS Iter: {iter_count[0]} | Loss: {loss_local.item():.4e}")
+            if metrics["mode"] == "energy":
+                print(
+                    f"{stage_name} L-BFGS Iter: {iter_count[0]} | Loss: {loss_local.item():.4e} | "
+                    f"Pi:{metrics['energy'].item():.4e} | U_int:{metrics['internal'].item():.4e} | "
+                    f"W_ext:{metrics['external'].item():.4e}"
+                )
+            elif metrics["mode"] == "disp_preserve":
+                print(
+                    f"{stage_name} L-BFGS Iter: {iter_count[0]} | Loss: {loss_local.item():.4e} | "
+                    f"Disp:{metrics['disp'].item():.4e}"
+                )
+            else:
+                print(f"{stage_name} L-BFGS Iter: {iter_count[0]} | Loss: {loss_local.item():.4e}")
 
         return loss_local
 
     optimizer_lbfgs.step(closure)
 
-    val_losses_after = compute_losses(model, *validation_samples)
-    val_loss_after = total_weighted_loss_from_losses(val_losses_after, base_w).detach()
+    val_metrics_after = compute_stage_metrics(model, base_w, *validation_samples)
+    val_loss_after = val_metrics_after["objective"].detach()
     print(f"[{stage_name} L-BFGS] validation loss after  = {val_loss_after.item():.4e}")
 
-    if val_loss_after > 1.05 * val_loss_before:
+    tolerance = 0.05 * max(abs(val_loss_before.item()), 1.0e-8)
+    if (val_loss_after.item() - val_loss_before.item()) > tolerance:
         model.load_state_dict(adam_state)
         print(f"[{stage_name} L-BFGS] validation got worse; restored Adam-final weights.")
     else:
@@ -761,6 +1194,7 @@ if __name__ == "__main__":
         X_side_free,
         X_top_free,
         X_radial_free,
+        save_path=os.path.join(SCRIPT_DIR, "sampling_points_preview_disp_only.png"),
     )
 
     print("[INFO] stress strategy = displacement only, all stresses are reconstructed from displacement gradients")
@@ -768,7 +1202,7 @@ if __name__ == "__main__":
     base_w_stage1 = torch.tensor(stage1_base_w, dtype=DTYPE, device=device)
     base_w_stage2 = torch.tensor(stage2_base_w, dtype=DTYPE, device=device)
 
-    stage1_save_path = "pinn_sector_disp_only_model_stage1_soft.pth"
+    stage1_save_path = pretrained_stage1_path
     if use_pretrained_stage1:
         if os.path.exists(pretrained_stage1_path):
             print(f"[INFO] loading existing stage-1 soft weights from: {pretrained_stage1_path}")
@@ -829,28 +1263,42 @@ if __name__ == "__main__":
     set_sampling_profile("stage2")
     print("\n[INFO] Switching to stage 2 hard/exact Dirichlet enforcement with stage-1 soft solution as the base field.")
 
-    run_adam_stage(
-        stage2_model,
-        stage_name="Stage2-HardADF",
-        base_w=base_w_stage2,
-        adam_epochs=stage2_adam_epochs,
-        learning_rate=stage2_lr,
-        plateau_patience=plateau_patience_stage2,
-    )
-    run_lbfgs_stage(
-        stage2_model,
-        stage_name="Stage2-HardADF",
-        base_w=base_w_stage2,
-        max_iter=stage2_lbfgs_max_iter,
-    )
-
-    print("Training Finished.")
-
-    final_save_path = "pinn_sector_disp_only_model.pth"
+    stage2_start_save_path = os.path.join(SCRIPT_DIR, "pinn_sector_disp_only_model_stage2_start.pth")
     torch.save(
         {
             "format": "stage2_hard_correction_v1",
-            "base_model_state_dict": model.state_dict(),
+            "base_model_state_dict": stage2_model.base_model.state_dict(),
+            "correction_net_state_dict": correction_net.state_dict(),
+        },
+        stage2_start_save_path,
+    )
+    print(f"[INFO] stage 2 start weights saved to: {stage2_start_save_path}")
+
+    if skip_stage2_training:
+        print("[INFO] skip_stage2_training = True; keeping Stage2-start as the final hard-constraint model.")
+    else:
+        run_adam_stage(
+            stage2_model,
+            stage_name="Stage2-HardADF",
+            base_w=base_w_stage2,
+            adam_epochs=stage2_adam_epochs,
+            learning_rate=stage2_lr,
+            plateau_patience=plateau_patience_stage2,
+        )
+        run_lbfgs_stage(
+            stage2_model,
+            stage_name="Stage2-HardADF",
+            base_w=base_w_stage2,
+            max_iter=stage2_lbfgs_max_iter,
+        )
+
+    print("Training Finished.")
+
+    final_save_path = os.path.join(SCRIPT_DIR, "pinn_sector_disp_only_model.pth")
+    torch.save(
+        {
+            "format": "stage2_hard_correction_v1",
+            "base_model_state_dict": stage2_model.base_model.state_dict(),
             "correction_net_state_dict": correction_net.state_dict(),
         },
         final_save_path,

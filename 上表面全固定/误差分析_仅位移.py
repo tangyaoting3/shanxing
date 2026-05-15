@@ -1,4 +1,4 @@
-import csv
+﻿import csv
 import math
 import os
 
@@ -17,33 +17,125 @@ from 扇形2_仅位移 import (
     mu,
     theta_max,
     theta_min,
+    U_REF,
+    adf_power,
+    project_to_top_surface,
+    top_blend_fraction,
+    top_surface_phi,
 )
 
 
 SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
 RESULT_DIR = os.path.join(SCRIPT_DIR, "result")
+RESULT_STAGE1_DIR = os.path.join(SCRIPT_DIR, "result_第一阶段")
+RESULT_STAGE2_START_DIR = os.path.join(SCRIPT_DIR, "result_实验A")
 WEIGHTS_DIR = os.path.join(SCRIPT_DIR, "weights")
 
-MODEL_PATH = os.path.join(WEIGHTS_DIR, "pinn_sector_disp_only_model (10).pth")
+MODEL_PATH = os.path.join(WEIGHTS_DIR, "pinn_sector_disp_only_model_stage1_soft (1).pth")
 FEM_UTOTAL_PATH = os.path.join(SCRIPT_DIR, "file503u.txt")
 FEM_VM_PATH = os.path.join(SCRIPT_DIR, "file503v.txt")
 TOP_FIXED_TOL = 1.0e-8
+TOP_REGION_FRACTION = top_blend_fraction
 
-# 当前 FEM 文件的扇形角度大约为 [-109.8, -70.2] deg，
-# 当前 PINN 模型的扇形角度大约为 [-19.8, 19.8] deg，
-# 因此比较前先绕 y 轴旋转 +90 deg 做坐标对齐。
+# The current FEM sector spans about [-109.8, -70.2] deg, while the PINN sector spans
+# about [-19.8, 19.8] deg. Rotate FEM points about y by +90 deg before comparison.
 FEM_ROTATE_Y_DEG = 90.0
+
+def infer_bc_mode_from_model_path(model_path):
+    filename = os.path.basename(model_path).lower()
+    if "stage1_soft" in filename:
+        return "soft"
+    return "hard_adf"
+
+
+def infer_result_dir_from_model_path(model_path):
+    filename = os.path.basename(model_path).lower()
+    if "stage1_soft" in filename:
+        return RESULT_STAGE1_DIR
+    if "stage2_start" in filename:
+        return RESULT_STAGE2_START_DIR
+    if filename.startswith("pinn_sector_disp_only_model"):
+        return RESULT_DIR
+    return RESULT_DIR
+
+
+CURRENT_RESULT_DIR = infer_result_dir_from_model_path(MODEL_PATH)
+
+
+class ZeroInitCorrectionNet(torch.nn.Module):
+    def __init__(self, layers):
+        super().__init__()
+        self.activation = torch.nn.SiLU()
+        self.linears = torch.nn.ModuleList(
+            [torch.nn.Linear(layers[i], layers[i + 1]) for i in range(len(layers) - 1)]
+        )
+
+        for layer in self.linears[:-1]:
+            torch.nn.init.xavier_normal_(layer.weight.data)
+            torch.nn.init.zeros_(layer.bias.data)
+
+        torch.nn.init.zeros_(self.linears[-1].weight.data)
+        torch.nn.init.zeros_(self.linears[-1].bias.data)
+
+    def forward(self, x_in):
+
+        a = 2.0 * (x_in - torch.tensor([-R_outer, 0.0, -R_outer], dtype=DTYPE, device=device)) / (
+            torch.tensor([R_outer, H_total, R_outer], dtype=DTYPE, device=device)
+            - torch.tensor([-R_outer, 0.0, -R_outer], dtype=DTYPE, device=device)
+        ) - 1.0
+        for layer in self.linears[:-1]:
+            a = self.activation(layer(a))
+        out = self.linears[-1](a)
+        return U_REF * out[:, 0:1], U_REF * out[:, 1:2], U_REF * out[:, 2:3]
+
+
+class HardCorrectionModel(torch.nn.Module):
+    def __init__(self, base_model, correction_net):
+        super().__init__()
+        self.base_model = base_model
+        self.correction_net = correction_net
+        self.bc_mode = "hard_adf"
+
+    def forward(self, x_in):
+        u_base, v_base, w_base = self.base_model(x_in)
+        x_top = project_to_top_surface(x_in)
+        u_top, v_top, w_top = self.base_model(x_top)
+        u_corr_raw, v_corr_raw, w_corr_raw = self.correction_net(x_in)
+        phi_top = top_surface_phi(x_in)
+
+        u = u_base - (1.0 - phi_top) * u_top + phi_top * u_corr_raw
+        v = v_base - (1.0 - phi_top) * v_top + phi_top * v_corr_raw
+        w = w_base - (1.0 - phi_top) * w_top + phi_top * w_corr_raw
+        return u, v, w
 
 
 def load_model(model_path=MODEL_PATH):
-    model = PINN3D([3, 192, 192, 192, 192, 192, 3]).to(device=device, dtype=DTYPE)
     if not os.path.exists(model_path):
-        raise FileNotFoundError(f"找不到模型文件: {model_path}")
-    model.load_state_dict(torch.load(model_path, map_location=device))
+        raise FileNotFoundError(f"Model file not found: {model_path}")
+
+    checkpoint = torch.load(model_path, map_location=device)
+    if isinstance(checkpoint, dict) and checkpoint.get("format") == "stage2_hard_correction_v1":
+        base_model = PINN3D([3, 192, 192, 192, 192, 192, 3], bc_mode="soft").to(device=device, dtype=DTYPE)
+        base_model.load_state_dict(checkpoint["base_model_state_dict"])
+        correction_net = ZeroInitCorrectionNet([3, 192, 192, 192, 192, 192, 3]).to(device=device, dtype=DTYPE)
+        correction_net.load_state_dict(checkpoint["correction_net_state_dict"])
+        model = HardCorrectionModel(base_model, correction_net).to(device=device, dtype=DTYPE)
+        model.eval()
+        print(f"[INFO] loaded model: {os.path.abspath(model_path)}")
+        print("[INFO] inferred model type for analysis: stage2_hard_correction_v1")
+        print(
+            f"[INFO] hard lifting during analysis follows training script: "
+            f"localized top blend fraction = {top_blend_fraction:g}, ADF power = {adf_power:g}"
+        )
+        return model
+
+    bc_mode = infer_bc_mode_from_model_path(model_path)
+    model = PINN3D([3, 192, 192, 192, 192, 192, 3], bc_mode=bc_mode).to(device=device, dtype=DTYPE)
+    model.load_state_dict(checkpoint)
     model.eval()
     print(f"[INFO] loaded model: {os.path.abspath(model_path)}")
+    print(f"[INFO] inferred bc_mode for analysis: {bc_mode}")
     return model
-
 
 def _clean_header(text):
     return text.replace("\ufeff", "").strip()
@@ -54,7 +146,7 @@ def read_fem_table(path):
         rows = list(csv.reader(f, delimiter="\t"))
 
     if not rows:
-        raise ValueError(f"文件为空: {path}")
+        raise ValueError(f"File is empty: {path}")
 
     header = [_clean_header(col) for col in rows[0] if _clean_header(col)]
     data_rows = []
@@ -64,7 +156,7 @@ def read_fem_table(path):
             data_rows.append(clean[:5])
 
     if not data_rows:
-        raise ValueError(f"文件中没有有效数据: {path}")
+        raise ValueError(f"No valid data rows found in file: {path}")
 
     arr = np.array(data_rows, dtype=np.float64)
     return {
@@ -161,17 +253,58 @@ def error_stats(ref, pred):
     }
 
 
+def masked_error_stats(ref, pred, mask):
+    if mask.dtype != np.bool_:
+        mask = mask.astype(bool)
+    count = int(np.count_nonzero(mask))
+    if count == 0:
+        return None
+    return error_stats(ref[mask], pred[mask])
+
+
+def format_report_lines(name, stats):
+    if stats is None:
+        return [
+            f"[{name}]",
+            "no points in this region",
+        ]
+    return [
+        f"[{name}]",
+        f"mean_abs = {stats['mean_abs']:.6e}",
+        f"max_abs  = {stats['max_abs']:.6e}",
+        f"mean_rel = {stats['mean_rel']:.6e}",
+        f"max_rel  = {stats['max_rel']:.6e}",
+        f"l2_rel   = {stats['l2_rel']:.6e}",
+    ]
+
+
 def print_report(name, stats):
-    print(f"\n[{name}]")
-    print(f"mean_abs = {stats['mean_abs']:.6e}")
-    print(f"max_abs  = {stats['max_abs']:.6e}")
-    print(f"mean_rel = {stats['mean_rel']:.6e}")
-    print(f"max_rel  = {stats['max_rel']:.6e}")
-    print(f"l2_rel   = {stats['l2_rel']:.6e}")
+    for line in format_report_lines(name, stats):
+        print(line)
+
+
+def write_text_report(lines, save_path):
+    with open(save_path, "w", encoding="utf-8") as f:
+        f.write("\n".join(lines).rstrip() + "\n")
+    print(f"[INFO] saved text report: {save_path}")
+
+
+def build_region_masks(pts):
+    y = pts[:, 1]
+    top_region_y = H_total - TOP_REGION_FRACTION * H_total
+    top_fixed_mask = np.isclose(y, H_total, atol=1.0e-10)
+    top_region_mask = y >= top_region_y - 1.0e-12
+    bulk_excluding_top_mask = ~top_region_mask
+    return {
+        "top_fixed_mask": top_fixed_mask,
+        "top_region_mask": top_region_mask,
+        "bulk_excluding_top_mask": bulk_excluding_top_mask,
+        "top_region_y": top_region_y,
+    }
 
 
 def result_path(filename):
-    return os.path.join(RESULT_DIR, filename)
+    return os.path.join(CURRENT_RESULT_DIR, filename)
 
 
 def save_series_plot(series_dict, title, ylabel, save_path):
@@ -364,6 +497,13 @@ def save_through_thickness_probe_plot(probe, pred_probe, save_path):
 
 def main():
     os.makedirs(RESULT_DIR, exist_ok=True)
+    os.makedirs(RESULT_STAGE1_DIR, exist_ok=True)
+    os.makedirs(RESULT_STAGE2_START_DIR, exist_ok=True)
+    print(f"[INFO] result output dir = {os.path.abspath(CURRENT_RESULT_DIR)}")
+    report_lines = [
+        f"[INFO] result output dir = {os.path.abspath(CURRENT_RESULT_DIR)}",
+        f"[INFO] model path = {os.path.abspath(MODEL_PATH)}",
+    ]
 
     fem_u = read_fem_table(FEM_UTOTAL_PATH)
     fem_vm = read_fem_table(FEM_VM_PATH)
@@ -372,7 +512,7 @@ def main():
     xyz_vm_raw = np.column_stack([fem_vm["x"], fem_vm["y"], fem_vm["z"]])
 
     if xyz_u_raw.shape != xyz_vm_raw.shape or not np.allclose(xyz_u_raw, xyz_vm_raw, atol=1.0e-12):
-        raise ValueError("FEM 总位移和等效应力文件的坐标点不一致，无法直接逐点对比。")
+        raise ValueError("FEM displacement and stress files do not share the same coordinates.")
 
     print_coordinate_summary("raw FEM points", xyz_u_raw)
     xyz_u = rotate_points_about_y(xyz_u_raw, FEM_ROTATE_Y_DEG)
@@ -383,16 +523,66 @@ def main():
         f"[INFO] model theta target = "
         f"[{math.degrees(theta_min):.3f}, {math.degrees(theta_max):.3f}] deg"
     )
+    report_lines.extend(
+        [
+            f"[INFO] compared model path = {os.path.abspath(MODEL_PATH)}",
+        ]
+    )
 
     model = load_model()
     pred = predict_on_points(model, xyz_u)
 
+    region_masks = build_region_masks(xyz_u)
+
     stats_u = error_stats(fem_u["value"], pred["utotal"])
     stats_vm = error_stats(fem_vm["value"], pred["vm"])
+    stats_u_top_fixed = masked_error_stats(fem_u["value"], pred["utotal"], region_masks["top_fixed_mask"])
+    stats_u_top_region = masked_error_stats(fem_u["value"], pred["utotal"], region_masks["top_region_mask"])
+    stats_u_bulk = masked_error_stats(fem_u["value"], pred["utotal"], region_masks["bulk_excluding_top_mask"])
+    stats_vm_top_fixed = masked_error_stats(fem_vm["value"], pred["vm"], region_masks["top_fixed_mask"])
+    stats_vm_top_region = masked_error_stats(fem_vm["value"], pred["vm"], region_masks["top_region_mask"])
+    stats_vm_bulk = masked_error_stats(fem_vm["value"], pred["vm"], region_masks["bulk_excluding_top_mask"])
 
     print(f"[INFO] compared points = {xyz_u.shape[0]}")
-    print_report("Total displacement", stats_u)
-    print_report("Von Mises from displacement gradients", stats_vm)
+    print(
+        f"[INFO] top-region split: y >= {region_masks['top_region_y']:.6e} m "
+        f"({TOP_REGION_FRACTION:.2%} of thickness from the top)"
+    )
+    print(
+        f"[INFO] top_fixed points = {np.count_nonzero(region_masks['top_fixed_mask'])} | "
+        f"top_region points = {np.count_nonzero(region_masks['top_region_mask'])} | "
+        f"bulk_excluding_top points = {np.count_nonzero(region_masks['bulk_excluding_top_mask'])}"
+    )
+    report_lines.extend(
+        [
+            f"[INFO] compared points = {xyz_u.shape[0]}",
+            (
+                f"[INFO] top-region split: y >= {region_masks['top_region_y']:.6e} m "
+                f"({TOP_REGION_FRACTION:.2%} of thickness from the top)"
+            ),
+            (
+                f"[INFO] top_fixed points = {np.count_nonzero(region_masks['top_fixed_mask'])} | "
+                f"top_region points = {np.count_nonzero(region_masks['top_region_mask'])} | "
+                f"bulk_excluding_top points = {np.count_nonzero(region_masks['bulk_excluding_top_mask'])}"
+            ),
+            "",
+        ]
+    )
+
+    for name, stats in [
+        ("Total displacement", stats_u),
+        ("Total displacement - top fixed only", stats_u_top_fixed),
+        ("Total displacement - top region", stats_u_top_region),
+        ("Total displacement - bulk excluding top region", stats_u_bulk),
+        ("Von Mises from displacement gradients", stats_vm),
+        ("Von Mises - top fixed only", stats_vm_top_fixed),
+        ("Von Mises - top region", stats_vm_top_region),
+        ("Von Mises - bulk excluding top region", stats_vm_bulk),
+    ]:
+        print()
+        print_report(name, stats)
+        report_lines.extend(format_report_lines(name, stats))
+        report_lines.append("")
 
     save_series_plot(
         {"FEM": fem_u["value"], "PINN": pred["utotal"]},
@@ -455,7 +645,26 @@ def main():
     print(f"|v| max = {np.max(top_abs_components[:, 1]):.6e}")
     print(f"|w| max = {np.max(top_abs_components[:, 2]):.6e}")
     print(f"fraction(utotal < {TOP_FIXED_TOL:.1e}) = {np.mean(top_utotal < TOP_FIXED_TOL):.6f}")
-    print("[INFO] current model has no output hard constraint on the top surface.")
+    if hasattr(model, "bc_mode") and model.bc_mode == "soft":
+        print("[INFO] current model uses soft Dirichlet treatment on the top surface during analysis.")
+        top_mode_line = "[INFO] current model uses soft Dirichlet treatment on the top surface during analysis."
+    else:
+        print("[INFO] current model uses exact top Dirichlet enforcement via the stage-2 ADF correction form.")
+        top_mode_line = "[INFO] current model uses exact top Dirichlet enforcement via the stage-2 ADF correction form."
+
+    report_lines.extend(
+        [
+            "[Top surface displacement diagnostic - current model]",
+            f"points = {top_pts.shape[0]}",
+            f"utotal mean = {np.mean(top_utotal):.6e}",
+            f"utotal max  = {np.max(top_utotal):.6e}",
+            f"|u| max = {np.max(top_abs_components[:, 0]):.6e}",
+            f"|v| max = {np.max(top_abs_components[:, 1]):.6e}",
+            f"|w| max = {np.max(top_abs_components[:, 2]):.6e}",
+            f"fraction(utotal < {TOP_FIXED_TOL:.1e}) = {np.mean(top_utotal < TOP_FIXED_TOL):.6f}",
+            top_mode_line,
+        ]
+    )
 
     save_series_plot(
         {
@@ -468,6 +677,7 @@ def main():
         "Displacement magnitude (m)",
         result_path("top_fixed_displacement_diagnostic_disp_only.png"),
     )
+    write_text_report(report_lines, result_path("error_report_disp_only.txt"))
 
 
 if __name__ == "__main__":
